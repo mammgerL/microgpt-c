@@ -1,6 +1,6 @@
 # microgpt-mac-c
 
-这是一个对齐 Karpathy `microgpt.py` 流程的 C 版本实现，并使用 macOS `Accelerate` 做计算加速。
+这是一个C版本的minigpt，并使用 macOS `Accelerate` 做计算加速。
 
 ## 已实现功能
 
