@@ -1,0 +1,13 @@
+# build
+microgpt_mac
+
+# runtime artifacts
+ckpt_best.bin
+losses.csv
+eval.csv
+
+# local dataset
+input.txt
+
+# macOS
+.DS_Store
