@@ -174,15 +174,17 @@ static void shuffle_lines(char** lines, int n) {
 
 static int prepare_example(const char* doc, int BOS, const int* char_to_id, int block_size, int* toks, TrainCache* cache) {
     int len = (int)strlen(doc);
+    int n = len + 1;
+    if (n > block_size) n = block_size;
+
     toks[0] = BOS;
-    for (int i = 0; i < len; i++) {
+    int doc_chars = (n < len) ? n : len;
+    for (int i = 0; i < doc_chars; i++) {
         unsigned char ch = (unsigned char)doc[i];
         toks[i + 1] = char_to_id[ch];
     }
-    toks[len + 1] = BOS;
+    if (n == len + 1) toks[n] = BOS;
 
-    int n = len + 1;
-    if (n > block_size) n = block_size;
     cache->n = n;
     for (int i = 0; i < n; i++) {
         cache->in_tokens[i] = toks[i];
@@ -425,14 +427,12 @@ static void free_train_cache(TrainCache* c) {
     free(c->attn_probs);
 }
 
-static inline float* cache_vec(float* base, int a, int b, int A, int B, int C) {
-    (void)A;
-    return base + ((size_t)a * B + b) * C;
+static inline float* cache_vec(float* base, int layer, int pos, int seq_cap, int width) {
+    return base + ((size_t)layer * seq_cap + pos) * width;
 }
 
-static inline float* cache_head(float* base, int l, int pos, int h, int L, int T, int H, int T2) {
-    (void)L;
-    return base + (((size_t)l * T + pos) * H + h) * T2;
+static inline float* cache_head(float* base, int layer, int pos, int head, int seq_cap, int n_head) {
+    return base + (((size_t)layer * seq_cap + pos) * n_head + head) * seq_cap;
 }
 
 static float forward_sequence(const Config* cfg, const Weights* w, TrainCache* c) {
@@ -442,6 +442,7 @@ static float forward_sequence(const Config* cfg, const Weights* w, TrainCache* c
     int D = cfg->head_dim;
     int L = cfg->n_layer;
     int V = cfg->vocab_size;
+    int TC = cfg->block_size;
 
     float* scratch_probs = (float*)malloc((size_t)V * sizeof(float));
     float total_loss = 0.0f;
@@ -458,17 +459,17 @@ static float forward_sequence(const Config* cfg, const Weights* w, TrainCache* c
         float* x_cur = x;
 
         for (int li = 0; li < L; li++) {
-            float* x_in = cache_vec(c->x_in, li, pos, L, T, E);
-            float* xn_attn = cache_vec(c->xn_attn, li, pos, L, T, E);
-            float* q = cache_vec(c->q, li, pos, L, T, E);
-            float* k = cache_vec(c->k, li, pos, L, T, E);
-            float* v = cache_vec(c->v, li, pos, L, T, E);
-            float* attn_out = cache_vec(c->attn_out, li, pos, L, T, E);
-            float* x_after_attn = cache_vec(c->x_after_attn, li, pos, L, T, E);
-            float* xn_mlp = cache_vec(c->xn_mlp, li, pos, L, T, E);
-            float* h1 = cache_vec(c->h1, li, pos, L, T, 4 * E);
-            float* h2 = cache_vec(c->h2, li, pos, L, T, 4 * E);
-            float* x_out = cache_vec(c->x_out, li, pos, L, T, E);
+            float* x_in = cache_vec(c->x_in, li, pos, TC, E);
+            float* xn_attn = cache_vec(c->xn_attn, li, pos, TC, E);
+            float* q = cache_vec(c->q, li, pos, TC, E);
+            float* k = cache_vec(c->k, li, pos, TC, E);
+            float* v = cache_vec(c->v, li, pos, TC, E);
+            float* attn_out = cache_vec(c->attn_out, li, pos, TC, E);
+            float* x_after_attn = cache_vec(c->x_after_attn, li, pos, TC, E);
+            float* xn_mlp = cache_vec(c->xn_mlp, li, pos, TC, E);
+            float* h1 = cache_vec(c->h1, li, pos, TC, 4 * E);
+            float* h2 = cache_vec(c->h2, li, pos, TC, 4 * E);
+            float* x_out = cache_vec(c->x_out, li, pos, TC, E);
 
             memcpy(x_in, x_cur, (size_t)E * sizeof(float));
             rmsnorm_forward(x_in, xn_attn, E);
@@ -486,10 +487,10 @@ static float forward_sequence(const Config* cfg, const Weights* w, TrainCache* c
 
             for (int h = 0; h < H; h++) {
                 int hs = h * D;
-                float* probs = cache_head(c->attn_probs, li, pos, h, L, cfg->block_size, H, cfg->block_size);
+                float* probs = cache_head(c->attn_probs, li, pos, h, TC, H);
 
                 for (int t = 0; t <= pos; t++) {
-                    const float* kt = cache_vec(c->k, li, t, L, T, E) + hs;
+                    const float* kt = cache_vec(c->k, li, t, TC, E) + hs;
                     probs[t] = cblas_sdot(D, q + hs, 1, kt, 1) / sqrtf((float)D);
                 }
                 softmax_forward(probs, probs, pos + 1, 1.0f);
@@ -497,7 +498,7 @@ static float forward_sequence(const Config* cfg, const Weights* w, TrainCache* c
                 float* out_h = attn_out + hs;
                 for (int j = 0; j < D; j++) out_h[j] = 0.0f;
                 for (int t = 0; t <= pos; t++) {
-                    const float* vt = cache_vec(c->v, li, t, L, T, E) + hs;
+                    const float* vt = cache_vec(c->v, li, t, TC, E) + hs;
                     cblas_saxpy(D, probs[t], vt, 1, out_h, 1);
                 }
             }
@@ -539,6 +540,7 @@ static void backward_sequence(const Config* cfg, const Weights* w, const TrainCa
     int D = cfg->head_dim;
     int L = cfg->n_layer;
     int V = cfg->vocab_size;
+    int TC = cfg->block_size;
 
     float invT = 1.0f / (float)T;
 
@@ -575,14 +577,14 @@ static void backward_sequence(const Config* cfg, const Weights* w, const TrainCa
         memcpy(d, row(d_top, E, pos), (size_t)E * sizeof(float));
 
         for (int li = L - 1; li >= 0; li--) {
-            float* x_in = cache_vec((float*)c->x_in, li, pos, L, T, E);
-            float* xn_attn = cache_vec((float*)c->xn_attn, li, pos, L, T, E);
-            float* q = cache_vec((float*)c->q, li, pos, L, T, E);
-            float* attn_out = cache_vec((float*)c->attn_out, li, pos, L, T, E);
-            float* x_after_attn = cache_vec((float*)c->x_after_attn, li, pos, L, T, E);
-            float* xn_mlp = cache_vec((float*)c->xn_mlp, li, pos, L, T, E);
-            float* h1 = cache_vec((float*)c->h1, li, pos, L, T, 4 * E);
-            float* h2 = cache_vec((float*)c->h2, li, pos, L, T, 4 * E);
+            float* x_in = cache_vec((float*)c->x_in, li, pos, TC, E);
+            float* xn_attn = cache_vec((float*)c->xn_attn, li, pos, TC, E);
+            float* q = cache_vec((float*)c->q, li, pos, TC, E);
+            float* attn_out = cache_vec((float*)c->attn_out, li, pos, TC, E);
+            float* x_after_attn = cache_vec((float*)c->x_after_attn, li, pos, TC, E);
+            float* xn_mlp = cache_vec((float*)c->xn_mlp, li, pos, TC, E);
+            float* h1 = cache_vec((float*)c->h1, li, pos, TC, 4 * E);
+            float* h2 = cache_vec((float*)c->h2, li, pos, TC, 4 * E);
 
             const float* Wq = w->attn_wq + (size_t)li * E * E;
             const float* Wk = w->attn_wk + (size_t)li * E * E;
@@ -622,11 +624,11 @@ static void backward_sequence(const Config* cfg, const Weights* w, const TrainCa
             for (int h = 0; h < H; h++) {
                 int hs = h * D;
                 const float* qh = q + hs;
-                const float* probs = cache_head((float*)c->attn_probs, li, pos, h, L, cfg->block_size, H, cfg->block_size);
+                const float* probs = cache_head((float*)c->attn_probs, li, pos, h, TC, H);
                 const float* d_head = d_attn_out + hs;
 
                 for (int t = 0; t <= pos; t++) {
-                    const float* vt = cache_vec((float*)c->v, li, t, L, T, E) + hs;
+                    const float* vt = cache_vec((float*)c->v, li, t, TC, E) + hs;
                     d_a[t] = cblas_sdot(D, d_head, 1, vt, 1);
                 }
 
@@ -638,9 +640,9 @@ static void backward_sequence(const Config* cfg, const Weights* w, const TrainCa
                 for (int j = 0; j < D; j++) dq_h[j] = 0.0f;
 
                 for (int t = 0; t <= pos; t++) {
-                    const float* kt = cache_vec((float*)c->k, li, t, L, T, E) + hs;
-                    float* dkt = cache_vec(dK, li, t, L, T, E) + hs;
-                    float* dvt = cache_vec(dV, li, t, L, T, E) + hs;
+                    const float* kt = cache_vec((float*)c->k, li, t, TC, E) + hs;
+                    float* dkt = cache_vec(dK, li, t, T, E) + hs;
+                    float* dvt = cache_vec(dV, li, t, T, E) + hs;
 
                     float inv_sqrt_d = 1.0f / sqrtf((float)D);
                     for (int j = 0; j < D; j++) {
@@ -651,8 +653,8 @@ static void backward_sequence(const Config* cfg, const Weights* w, const TrainCa
                 }
             }
 
-            float* dk_cur = cache_vec(dK, li, pos, L, T, E);
-            float* dv_cur = cache_vec(dV, li, pos, L, T, E);
+            float* dk_cur = cache_vec(dK, li, pos, T, E);
+            float* dv_cur = cache_vec(dV, li, pos, T, E);
 
             outer_add(g->attn_wq + (size_t)li * E * E, d_xn, xn_attn, E, E);
             linear_t_accum(Wq, d_xn, tmpE, E, E);
@@ -908,25 +910,48 @@ int main(int argc, char** argv) {
     build_vocab(docs, n_docs, id_to_char, &vocab_size, char_to_id);
     int BOS = vocab_size - 1;
 
-    Config cfg = {
-        .n_embd = 16,
-        .n_head = 4,
-        .n_layer = 1,
-        .block_size = 8,
-        .head_dim = 16 / 4,
-        .vocab_size = vocab_size,
-    };
-
     int num_steps = 500;
     float temperature = 0.5f;
     int num_samples = 20;
     int eval_interval = 100;
     int eval_iters = 100;
+    float learning_rate = 3e-3f;
+    int n_embd = 32;
+    int n_head = 4;
+    int n_layer = 2;
+    int block_size = 16;
     if (argc > 1) num_steps = atoi(argv[1]);
     if (argc > 2) temperature = atof(argv[2]);
     if (argc > 3) num_samples = atoi(argv[3]);
     if (argc > 4) eval_interval = atoi(argv[4]);
     if (argc > 5) eval_iters = atoi(argv[5]);
+    if (argc > 6) n_embd = atoi(argv[6]);
+    if (argc > 7) n_head = atoi(argv[7]);
+    if (argc > 8) n_layer = atoi(argv[8]);
+    if (argc > 9) block_size = atoi(argv[9]);
+    if (argc > 10) learning_rate = atof(argv[10]);
+
+    if (n_embd <= 0 || n_head <= 0 || n_layer <= 0 || block_size <= 0) {
+        fprintf(stderr, "error: n_embd, n_head, n_layer, block_size must be positive\n");
+        return 1;
+    }
+    if (learning_rate <= 0.0f) {
+        fprintf(stderr, "error: learning_rate must be positive\n");
+        return 1;
+    }
+    if ((n_embd % n_head) != 0) {
+        fprintf(stderr, "error: n_embd (%d) must be divisible by n_head (%d)\n", n_embd, n_head);
+        return 1;
+    }
+
+    Config cfg = {
+        .n_embd = n_embd,
+        .n_head = n_head,
+        .n_layer = n_layer,
+        .block_size = block_size,
+        .head_dim = n_embd / n_head,
+        .vocab_size = vocab_size,
+    };
 
     Weights w = {0};
     alloc_weights(&cfg, &w);
@@ -944,9 +969,11 @@ int main(int argc, char** argv) {
 
     printf("num docs: %d\n", n_docs);
     printf("vocab size: %d\n", cfg.vocab_size);
+    printf("model: n_embd=%d n_head=%d n_layer=%d block_size=%d lr=%.6f\n",
+           cfg.n_embd, cfg.n_head, cfg.n_layer, cfg.block_size, learning_rate);
     printf("num params: %zu\n", param_count(&cfg));
 
-    float learning_rate = 1e-2f, beta1 = 0.9f, beta2 = 0.95f, eps_adam = 1e-8f;
+    float beta1 = 0.9f, beta2 = 0.95f, eps_adam = 1e-8f;
     int n_val = n_docs / 10;
     if (n_docs > 1 && n_val < 1) n_val = 1;
     if (n_docs > 1 && n_val >= n_docs) n_val = n_docs - 1;

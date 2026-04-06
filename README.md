@@ -28,18 +28,22 @@
 
 ```bash
 make
-./microgpt_mac                             # steps=500, temp=0.5, samples=20, eval_interval=100, eval_iters=100
+./microgpt_mac                             # steps=500, temp=0.5, samples=20, eval_interval=100, eval_iters=100, model=32x4x2, block=16, lr=3e-3
 ./microgpt_mac 1000                        # steps=1000
 ./microgpt_mac 1000 0.7 30                 # 额外指定 temperature 和 sample 数
 ./microgpt_mac 2000 0.7 30 200 200         # 额外指定 eval_interval 和 eval_iters
+./microgpt_mac 2000 0.7 20 200 100 64 4 2 24 0.001
+                                          # 额外指定 n_embd n_head n_layer block_size learning_rate
 ```
 
 请将语料放在当前目录的 `input.txt` 中（每行一条样本）。
 
 ## 说明
 
-- 默认超参数对齐 Python gist 的小模型配置：`n_embd=16`, `n_head=4`, `n_layer=1`, `block_size=8`。
+- 当前默认实验配置：`n_embd=32`, `n_head=4`, `n_layer=2`, `block_size=16`, `learning_rate=3e-3`。
+- 如需回到最小教学配置，可使用：`./microgpt_mac 500 0.5 20 100 100 16 4 1 8 0.01`
 - 核心数学计算使用 `Accelerate`（`cblas_sgemv/sdot/saxpy` 与 `vDSP`）。
+- 2026-04-06 修复了长样本触发的 `prepare_example` 越界写问题，并修正了多层模型缓存索引；现在可以稳定跑更长训练和更大的 `n_layer`。
 
 ## 性能
 
