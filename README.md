@@ -45,6 +45,7 @@ make
 - 生成单轮鱼人格聊天语料
 - 用现有字符级训练器训练聊天格式样本
 - 训练后基于用户 prompt 做单轮回复
+- 对聊天语料自动启用更接近 `guppylm` 的模型配置：`LayerNorm + tied embeddings`
 
 生成语料：
 
@@ -65,6 +66,13 @@ make
 ./microgpt_mac 500 0.7 3 250 50 64 4 2 128 0.001 guppy_input.txt
 ```
 
+如果数据看起来像聊天样本（包含 `<|user|>` 和 `<|assistant|>`），程序会自动：
+
+- 将 `norm` 切到 `LayerNorm`
+- 启用 `tied embeddings`
+- 至少使用 `block_size=128`
+- 将过高的学习率压到 `1e-3`
+
 训练后直接给一个 prompt：
 
 ```bash
@@ -80,8 +88,58 @@ make
 说明：
 
 - 这是在当前字符级 C 训练器上的第一版 Guppy 功能迁移，不是 `guppylm` 的完整复刻。
-- 当前没有移植 BPE tokenizer、batch 训练、ONNX 导出和浏览器推理。
+- 当前已经迁入的关键点：聊天数据格式、单轮 prompt 推理、`LayerNorm`、`tied embeddings`。
+- 当前还没有移植：BPE tokenizer、batch 训练、dropout、ONNX 导出和浏览器推理。
 - 要得到更像样的聊天输出，通常需要更长训练步数和更大的 `block_size`。
+
+## Guppy BPE Mode
+
+当前版本还加入了一个更接近 `guppylm` 训练方式的离线路径：
+
+- 使用 Python 脚本生成 Guppy 聊天语料
+- 训练 ByteLevel BPE tokenizer
+- 导出连续 token 流：
+  - `train.bin`
+  - `eval.bin`
+  - `meta.json`
+  - `tokenizer.json`
+- C 训练器直接读取 `train.bin` 做 token-stream 训练
+
+准备依赖：
+
+```bash
+python3 -m pip install --user tokenizers
+```
+
+准备 BPE 数据：
+
+```bash
+python3 scripts/prepare_guppy_bpe.py --out-dir data/guppy_bpe --samples 60000 --vocab-size 1024
+```
+
+训练 token 模式：
+
+```bash
+./microgpt_mac 1000 0.7 1 200 50 64 4 2 128 0.001 data/guppy_bpe/train.bin
+```
+
+用训练好的 checkpoint 聊天：
+
+```bash
+python3 scripts/chat_guppy_bpe.py "tell me a joke" --data-dir data/guppy_bpe --ckpt ckpt_best.bin
+```
+
+当 `dataset_path` 是 `train.bin` 时，程序会自动：
+
+- 从同目录推断 `eval.bin` 和 `meta.json`
+- 读取 `u16` token 流
+- 启用 token-stream 随机窗口采样
+- 使用 `LayerNorm + tied embeddings`
+
+当前限制：
+
+- `tokenizer.json` 的编码/解码仍在 Python 侧
+- C 核心现在能按 token id 采样，但自然语言聊天仍通过 `scripts/chat_guppy_bpe.py` 包一层
 
 ## 说明
 

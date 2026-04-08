@@ -16,7 +16,23 @@ typedef struct {
     int block_size;
     int head_dim;
     int vocab_size;
+    int norm_kind;
+    int tie_embeddings;
 } Config;
+
+typedef struct {
+    int n_embd;
+    int n_head;
+    int n_layer;
+    int block_size;
+    int head_dim;
+    int vocab_size;
+} ConfigV1;
+
+enum {
+    NORM_RMS = 0,
+    NORM_LAYER = 1,
+};
 
 typedef struct {
     float* wte;      // [V, E]
@@ -84,6 +100,18 @@ typedef struct {
 
     float* attn_probs;    // [L, n, H, n]
 } TrainCache;
+
+typedef struct {
+    uint16_t* train_tokens;
+    uint16_t* val_tokens;
+    size_t n_train_tokens;
+    size_t n_val_tokens;
+    int vocab_size;
+    int pad_id;
+    int user_id;
+    int assistant_id;
+    int end_id;
+} TokenCorpus;
 
 static const char* kChatUserTag = "<|user|>";
 static const char* kChatAssistantTag = "<|assistant|>";
@@ -175,6 +203,160 @@ static void shuffle_lines(char** lines, int n) {
         lines[i] = lines[j];
         lines[j] = tmp;
     }
+}
+
+static bool dataset_looks_like_chat(char** docs, int n_docs) {
+    int limit = n_docs < 8 ? n_docs : 8;
+    for (int i = 0; i < limit; i++) {
+        if (strstr(docs[i], kChatUserTag) && strstr(docs[i], kChatAssistantTag)) return true;
+    }
+    return false;
+}
+
+static bool path_has_suffix(const char* s, const char* suffix) {
+    size_t n = strlen(s);
+    size_t m = strlen(suffix);
+    if (m > n) return false;
+    return strcmp(s + (n - m), suffix) == 0;
+}
+
+static const char* norm_kind_name(int norm_kind) {
+    return norm_kind == NORM_LAYER ? "layernorm" : "rmsnorm";
+}
+
+static bool read_text_file(const char* path, char** out_text) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char* buf = (char*)malloc((size_t)sz + 1);
+    if (!buf) {
+        fclose(f);
+        return false;
+    }
+    if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
+        fclose(f);
+        free(buf);
+        return false;
+    }
+    fclose(f);
+    buf[sz] = '\0';
+    *out_text = buf;
+    return true;
+}
+
+static int json_int_field(const char* text, const char* key, int fallback) {
+    char needle[128];
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    const char* p = strstr(text, needle);
+    if (!p) return fallback;
+    p = strchr(p, ':');
+    if (!p) return fallback;
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+    return atoi(p);
+}
+
+static bool json_string_field(const char* text, const char* key, char* out, size_t out_sz) {
+    char needle[128];
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    const char* p = strstr(text, needle);
+    if (!p) return false;
+    p = strchr(p, ':');
+    if (!p) return false;
+    p = strchr(p, '"');
+    if (!p) return false;
+    p++;
+    const char* q = strchr(p, '"');
+    if (!q) return false;
+    size_t n = (size_t)(q - p);
+    if (n + 1 > out_sz) n = out_sz - 1;
+    memcpy(out, p, n);
+    out[n] = '\0';
+    return true;
+}
+
+static void infer_token_paths(const char* train_path, char* eval_path, size_t eval_sz,
+                              char* meta_path, size_t meta_sz) {
+    snprintf(eval_path, eval_sz, "%s", train_path);
+    snprintf(meta_path, meta_sz, "%s", train_path);
+
+    char* eval_name = strrchr(eval_path, '/');
+    eval_name = eval_name ? eval_name + 1 : eval_path;
+    snprintf(eval_name, eval_sz - (size_t)(eval_name - eval_path), "eval.bin");
+
+    char* meta_name = strrchr(meta_path, '/');
+    meta_name = meta_name ? meta_name + 1 : meta_path;
+    snprintf(meta_name, meta_sz - (size_t)(meta_name - meta_path), "meta.json");
+}
+
+static bool load_token_file_u16(const char* path, uint16_t** out_tokens, size_t* out_n) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz < 0 || (sz % (long)sizeof(uint16_t)) != 0) {
+        fclose(f);
+        return false;
+    }
+    size_t n = (size_t)sz / sizeof(uint16_t);
+    uint16_t* buf = (uint16_t*)malloc(n * sizeof(uint16_t));
+    if (!buf) {
+        fclose(f);
+        return false;
+    }
+    if (fread(buf, sizeof(uint16_t), n, f) != n) {
+        fclose(f);
+        free(buf);
+        return false;
+    }
+    fclose(f);
+    *out_tokens = buf;
+    *out_n = n;
+    return true;
+}
+
+static bool load_token_corpus(const char* train_path, TokenCorpus* corpus) {
+    char eval_path[1024];
+    char meta_path[1024];
+    char dtype[32];
+    infer_token_paths(train_path, eval_path, sizeof(eval_path), meta_path, sizeof(meta_path));
+
+    char* meta_text = NULL;
+    if (!read_text_file(meta_path, &meta_text)) return false;
+    if (!json_string_field(meta_text, "dtype", dtype, sizeof(dtype))) {
+        free(meta_text);
+        return false;
+    }
+    if (strcmp(dtype, "u16") != 0) {
+        fprintf(stderr, "error: only u16 token datasets are currently supported\n");
+        free(meta_text);
+        return false;
+    }
+
+    corpus->vocab_size = json_int_field(meta_text, "vocab_size", -1);
+    corpus->pad_id = json_int_field(meta_text, "pad_id", 0);
+    corpus->user_id = json_int_field(meta_text, "user_id", -1);
+    corpus->assistant_id = json_int_field(meta_text, "assistant_id", -1);
+    corpus->end_id = json_int_field(meta_text, "end_id", -1);
+    free(meta_text);
+
+    if (corpus->vocab_size <= 0) return false;
+    if (!load_token_file_u16(train_path, &corpus->train_tokens, &corpus->n_train_tokens)) return false;
+    if (!load_token_file_u16(eval_path, &corpus->val_tokens, &corpus->n_val_tokens)) {
+        free(corpus->train_tokens);
+        corpus->train_tokens = NULL;
+        return false;
+    }
+    return corpus->n_train_tokens > 1 && corpus->n_val_tokens > 1;
+}
+
+static void free_token_corpus(TokenCorpus* corpus) {
+    free(corpus->train_tokens);
+    free(corpus->val_tokens);
+    memset(corpus, 0, sizeof(*corpus));
 }
 
 static const char* pick_str(const char* const* items, int count) {
@@ -380,6 +562,46 @@ static int prepare_example(const char* doc, int BOS, const int* char_to_id, int 
     return n;
 }
 
+static int prepare_token_example(const uint16_t* tokens, size_t n_tokens, int block_size, TrainCache* cache) {
+    if (n_tokens < 2) return 0;
+    int n = block_size;
+    if ((size_t)(n + 1) > n_tokens) n = (int)n_tokens - 1;
+    size_t max_start = n_tokens - (size_t)(n + 1);
+    size_t start = (max_start > 0) ? (size_t)(rand() % (int)(max_start + 1)) : 0;
+    cache->n = n;
+    for (int i = 0; i < n; i++) {
+        cache->in_tokens[i] = tokens[start + (size_t)i];
+        cache->targets[i] = tokens[start + (size_t)i + 1];
+    }
+    return n;
+}
+
+static int parse_token_id_list(const char* text, int vocab_size, int* ids, int max_ids) {
+    char* copy = strdup(text);
+    if (!copy) return -1;
+
+    int n = 0;
+    char* save = NULL;
+    char* tok = strtok_r(copy, ", \t\r\n", &save);
+    while (tok) {
+        if (n >= max_ids) {
+            free(copy);
+            return -1;
+        }
+        char* end = NULL;
+        long v = strtol(tok, &end, 10);
+        if (tok[0] == '\0' || !end || end[0] != '\0' || v < 0 || v >= vocab_size) {
+            free(copy);
+            return -1;
+        }
+        ids[n++] = (int)v;
+        tok = strtok_r(NULL, ", \t\r\n", &save);
+    }
+
+    free(copy);
+    return n;
+}
+
 static void build_vocab(char** docs, int n_docs, char* id_to_char, int* vocab_size, int* char_to_id) {
     bool seen[256] = {0};
     for (int i = 0; i < n_docs; i++) {
@@ -441,6 +663,80 @@ static void rmsnorm_backward(const float* x, const float* dy, float* dx, int n) 
     for (int i = 0; i < n; i++) dx[i] += dy[i] * s + x[i] * coeff;
 }
 
+static void layernorm_forward(const float* x, float* y, int n) {
+    float mean = 0.0f;
+    for (int i = 0; i < n; i++) mean += x[i];
+    mean /= (float)n;
+
+    float var = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float d = x[i] - mean;
+        var += d * d;
+    }
+    var /= (float)n;
+    float inv_std = 1.0f / sqrtf(var + 1e-5f);
+
+    for (int i = 0; i < n; i++) y[i] = (x[i] - mean) * inv_std;
+}
+
+static void layernorm_backward(const float* x, const float* dy, float* dx, int n) {
+    float mean = 0.0f;
+    for (int i = 0; i < n; i++) mean += x[i];
+    mean /= (float)n;
+
+    float var = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float d = x[i] - mean;
+        var += d * d;
+    }
+    var /= (float)n;
+    float inv_std = 1.0f / sqrtf(var + 1e-5f);
+
+    float mean_dy = 0.0f;
+    float mean_dy_xhat = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float xhat = (x[i] - mean) * inv_std;
+        mean_dy += dy[i];
+        mean_dy_xhat += dy[i] * xhat;
+    }
+    mean_dy /= (float)n;
+    mean_dy_xhat /= (float)n;
+
+    for (int i = 0; i < n; i++) {
+        float xhat = (x[i] - mean) * inv_std;
+        dx[i] += inv_std * (dy[i] - mean_dy - xhat * mean_dy_xhat);
+    }
+}
+
+static void norm_forward(const Config* cfg, const float* x, float* y, int n) {
+    if (cfg->norm_kind == NORM_LAYER) layernorm_forward(x, y, n);
+    else rmsnorm_forward(x, y, n);
+}
+
+static void norm_backward(const Config* cfg, const float* x, const float* dy, float* dx, int n) {
+    if (cfg->norm_kind == NORM_LAYER) layernorm_backward(x, dy, dx, n);
+    else rmsnorm_backward(x, dy, dx, n);
+}
+
+static const float* lm_head_weight(const Config* cfg, const Weights* w) {
+    return cfg->tie_embeddings ? w->wte : w->lm_head;
+}
+
+static float* lm_head_grad(const Config* cfg, Grads* g) {
+    return cfg->tie_embeddings ? g->wte : g->lm_head;
+}
+
+static bool config_matches(const Config* a, const Config* b) {
+    return a->n_embd == b->n_embd &&
+           a->n_head == b->n_head &&
+           a->n_layer == b->n_layer &&
+           a->block_size == b->block_size &&
+           a->head_dim == b->head_dim &&
+           a->vocab_size == b->vocab_size &&
+           a->norm_kind == b->norm_kind &&
+           a->tie_embeddings == b->tie_embeddings;
+}
+
 static void softmax_forward(const float* logits, float* probs, int n, float temperature) {
     float inv_t = 1.0f / fmaxf(temperature, 1e-4f);
     for (int i = 0; i < n; i++) probs[i] = logits[i] * inv_t;
@@ -471,7 +767,8 @@ static size_t param_count(const Config* cfg) {
     size_t E = (size_t)cfg->n_embd;
     size_t L = (size_t)cfg->n_layer;
     size_t B = (size_t)cfg->block_size;
-    return V * E + B * E + V * E + 4 * (L * E * E) + L * (4 * E) * E + L * E * (4 * E);
+    size_t lm_head = cfg->tie_embeddings ? 0 : (V * E);
+    return V * E + B * E + lm_head + 4 * (L * E * E) + L * (4 * E) * E + L * E * (4 * E);
 }
 
 static void alloc_weights(const Config* cfg, Weights* w) {
@@ -513,7 +810,8 @@ static void init_weights(const Config* cfg, Weights* w) {
 
     init_mat(w->wte, V * E, 0.02f);
     init_mat(w->wpe, B * E, 0.02f);
-    init_mat(w->lm_head, V * E, 0.02f);
+    if (cfg->tie_embeddings) memcpy(w->lm_head, w->wte, V * E * sizeof(float));
+    else init_mat(w->lm_head, V * E, 0.02f);
 
     init_mat(w->attn_wq, L * E * E, 0.02f);
     init_mat(w->attn_wk, L * E * E, 0.02f);
@@ -641,7 +939,7 @@ static float forward_sequence(const Config* cfg, const Weights* w, TrainCache* c
         const float* tok = row(w->wte, E, c->in_tokens[pos]);
         const float* pe = row(w->wpe, E, pos);
         for (int i = 0; i < E; i++) es[i] = tok[i] + pe[i];
-        rmsnorm_forward(es, x, E);
+        norm_forward(cfg, es, x, E);
 
         float* x_cur = x;
 
@@ -659,7 +957,7 @@ static float forward_sequence(const Config* cfg, const Weights* w, TrainCache* c
             float* x_out = cache_vec(c->x_out, li, pos, TC, E);
 
             memcpy(x_in, x_cur, (size_t)E * sizeof(float));
-            rmsnorm_forward(x_in, xn_attn, E);
+            norm_forward(cfg, x_in, xn_attn, E);
 
             const float* Wq = w->attn_wq + (size_t)li * E * E;
             const float* Wk = w->attn_wk + (size_t)li * E * E;
@@ -693,7 +991,7 @@ static float forward_sequence(const Config* cfg, const Weights* w, TrainCache* c
             linear(Wo, attn_out, x_after_attn, E, E);
             for (int i = 0; i < E; i++) x_after_attn[i] += x_in[i];
 
-            rmsnorm_forward(x_after_attn, xn_mlp, E);
+            norm_forward(cfg, x_after_attn, xn_mlp, E);
             const float* W1 = w->mlp_fc1 + (size_t)li * (4 * E) * E;
             const float* W2 = w->mlp_fc2 + (size_t)li * E * (4 * E);
 
@@ -709,7 +1007,7 @@ static float forward_sequence(const Config* cfg, const Weights* w, TrainCache* c
         }
 
         memcpy(row(c->x_final, E, pos), x_cur, (size_t)E * sizeof(float));
-        linear(w->lm_head, x_cur, row(c->logits, V, pos), V, E);
+        linear(lm_head_weight(cfg, w), x_cur, row(c->logits, V, pos), V, E);
 
         softmax_forward(row(c->logits, V, pos), scratch_probs, V, 1.0f);
         int tgt = c->targets[pos];
@@ -739,8 +1037,8 @@ static void backward_sequence(const Config* cfg, const Weights* w, const TrainCa
         d_logits[c->targets[pos]] -= 1.0f;
         for (int i = 0; i < V; i++) d_logits[i] *= invT;
 
-        outer_add(g->lm_head, d_logits, row((float*)c->x_final, E, pos), V, E);
-        linear_t_accum(w->lm_head, d_logits, row(d_top, E, pos), V, E);
+        outer_add(lm_head_grad(cfg, g), d_logits, row((float*)c->x_final, E, pos), V, E);
+        linear_t_accum(lm_head_weight(cfg, w), d_logits, row(d_top, E, pos), V, E);
     }
 
     float* dK = (float*)calloc((size_t)L * T * E, sizeof(float));
@@ -796,7 +1094,7 @@ static void backward_sequence(const Config* cfg, const Weights* w, const TrainCa
             for (int i = 0; i < E; i++) d_xn[i] = 0.0f;
             linear_t_accum(W1, d_h1, d_xn, 4 * E, E);
 
-            rmsnorm_backward(x_after_attn, d_xn, d_xin, E);
+            norm_backward(cfg, x_after_attn, d_xn, d_xin, E);
 
             // Attention block backward
             memcpy(d_attn_out, d_xin, (size_t)E * sizeof(float));  // through Wo path
@@ -853,11 +1151,11 @@ static void backward_sequence(const Config* cfg, const Weights* w, const TrainCa
             linear_t_accum(Wv, dv_cur, tmpE, E, E);
 
             for (int i = 0; i < E; i++) d[i] = 0.0f;
-            rmsnorm_backward(x_in, tmpE, d, E);
+            norm_backward(cfg, x_in, tmpE, d, E);
         }
 
         for (int i = 0; i < E; i++) d_embed[i] = 0.0f;
-        rmsnorm_backward(row((float*)c->embed_sum, E, pos), d, d_embed, E);
+        norm_backward(cfg, row((float*)c->embed_sum, E, pos), d, d_embed, E);
 
         float* gwte = row(g->wte, E, c->in_tokens[pos]);
         float* gwpe = row(g->wpe, E, pos);
@@ -908,7 +1206,9 @@ static void adam_update(const Config* cfg, Weights* w, const Grads* g, AdamBuf* 
 
     adam_update_array(w->wte, g->wte, m1->wte, m2->wte, V * E, lr_t, beta1, beta2, eps, step1);
     adam_update_array(w->wpe, g->wpe, m1->wpe, m2->wpe, B * E, lr_t, beta1, beta2, eps, step1);
-    adam_update_array(w->lm_head, g->lm_head, m1->lm_head, m2->lm_head, V * E, lr_t, beta1, beta2, eps, step1);
+    if (!cfg->tie_embeddings) {
+        adam_update_array(w->lm_head, g->lm_head, m1->lm_head, m2->lm_head, V * E, lr_t, beta1, beta2, eps, step1);
+    }
 
     adam_update_array(w->attn_wq, g->attn_wq, m1->attn_wq, m2->attn_wq, L * E * E, lr_t, beta1, beta2, eps, step1);
     adam_update_array(w->attn_wk, g->attn_wk, m1->attn_wk, m2->attn_wk, L * E * E, lr_t, beta1, beta2, eps, step1);
@@ -940,11 +1240,11 @@ static void gpt_infer_step(const Config* cfg, const Weights* w,
     const float* tok = row(w->wte, E, token_id);
     const float* pe = row(w->wpe, E, pos_id);
     for (int i = 0; i < E; i++) tmp[i] = tok[i] + pe[i];
-    rmsnorm_forward(tmp, x, E);
+    norm_forward(cfg, tmp, x, E);
 
     for (int li = 0; li < L; li++) {
         memcpy(tmp, x, (size_t)E * sizeof(float));
-        rmsnorm_forward(x, xn, E);
+        norm_forward(cfg, x, xn, E);
 
         const float* Wq = w->attn_wq + (size_t)li * E * E;
         const float* Wk = w->attn_wk + (size_t)li * E * E;
@@ -981,7 +1281,7 @@ static void gpt_infer_step(const Config* cfg, const Weights* w,
         for (int i = 0; i < E; i++) x[i] += tmp[i];
 
         memcpy(tmp, x, (size_t)E * sizeof(float));
-        rmsnorm_forward(x, xn, E);
+        norm_forward(cfg, x, xn, E);
 
         const float* W1 = w->mlp_fc1 + (size_t)li * (4 * E) * E;
         const float* W2 = w->mlp_fc2 + (size_t)li * E * (4 * E);
@@ -994,7 +1294,7 @@ static void gpt_infer_step(const Config* cfg, const Weights* w,
         for (int i = 0; i < E; i++) x[i] += tmp[i];
     }
 
-    linear(w->lm_head, x, logits, cfg->vocab_size, E);
+    linear(lm_head_weight(cfg, w), x, logits, cfg->vocab_size, E);
 
     free(x);
     free(tmp);
@@ -1019,11 +1319,22 @@ static float eval_split_loss(const Config* cfg, const Weights* w, TrainCache* ca
     return s / (float)eval_iters;
 }
 
+static float eval_token_loss(const Config* cfg, const Weights* w, TrainCache* cache,
+                             const uint16_t* tokens, size_t n_tokens, int eval_iters) {
+    if (n_tokens <= 1) return NAN;
+    float s = 0.0f;
+    for (int i = 0; i < eval_iters; i++) {
+        prepare_token_example(tokens, n_tokens, cfg->block_size, cache);
+        s += forward_sequence(cfg, w, cache);
+    }
+    return s / (float)eval_iters;
+}
+
 static bool save_checkpoint(const char* path, const Config* cfg, const Weights* w) {
     FILE* f = fopen(path, "wb");
     if (!f) return false;
     const uint32_t magic = 0x4D475043;  // MGPC
-    const uint32_t version = 1;
+    const uint32_t version = 2;
     if (fwrite(&magic, sizeof(magic), 1, f) != 1) goto fail;
     if (fwrite(&version, sizeof(version), 1, f) != 1) goto fail;
     if (fwrite(cfg, sizeof(*cfg), 1, f) != 1) goto fail;
@@ -1031,7 +1342,8 @@ static bool save_checkpoint(const char* path, const Config* cfg, const Weights* 
     size_t V = (size_t)cfg->vocab_size, E = (size_t)cfg->n_embd, L = (size_t)cfg->n_layer, B = (size_t)cfg->block_size;
     if (fwrite(w->wte, sizeof(float), V * E, f) != V * E) goto fail;
     if (fwrite(w->wpe, sizeof(float), B * E, f) != B * E) goto fail;
-    if (fwrite(w->lm_head, sizeof(float), V * E, f) != V * E) goto fail;
+    const float* lm_head = cfg->tie_embeddings ? w->wte : w->lm_head;
+    if (fwrite(lm_head, sizeof(float), V * E, f) != V * E) goto fail;
     if (fwrite(w->attn_wq, sizeof(float), L * E * E, f) != L * E * E) goto fail;
     if (fwrite(w->attn_wk, sizeof(float), L * E * E, f) != L * E * E) goto fail;
     if (fwrite(w->attn_wv, sizeof(float), L * E * E, f) != L * E * E) goto fail;
@@ -1052,8 +1364,25 @@ static bool load_checkpoint_config(const char* path, Config* out_cfg) {
     bool ok = false;
     if (fread(&magic, sizeof(magic), 1, f) != 1) goto done;
     if (fread(&version, sizeof(version), 1, f) != 1) goto done;
-    if (fread(out_cfg, sizeof(*out_cfg), 1, f) != 1) goto done;
-    ok = (magic == 0x4D475043 && version == 1);
+    if (magic != 0x4D475043) goto done;
+    if (version == 1) {
+        ConfigV1 old = {0};
+        if (fread(&old, sizeof(old), 1, f) != 1) goto done;
+        *out_cfg = (Config){
+            .n_embd = old.n_embd,
+            .n_head = old.n_head,
+            .n_layer = old.n_layer,
+            .block_size = old.block_size,
+            .head_dim = old.head_dim,
+            .vocab_size = old.vocab_size,
+            .norm_kind = NORM_RMS,
+            .tie_embeddings = 0,
+        };
+        ok = true;
+    } else if (version == 2) {
+        if (fread(out_cfg, sizeof(*out_cfg), 1, f) != 1) goto done;
+        ok = true;
+    }
 done:
     fclose(f);
     return ok;
@@ -1066,9 +1395,26 @@ static bool load_checkpoint(const char* path, const Config* cfg, Weights* w) {
     Config ck = {0};
     if (fread(&magic, sizeof(magic), 1, f) != 1) goto fail;
     if (fread(&version, sizeof(version), 1, f) != 1) goto fail;
-    if (fread(&ck, sizeof(ck), 1, f) != 1) goto fail;
-    if (magic != 0x4D475043 || version != 1) goto fail;
-    if (memcmp(&ck, cfg, sizeof(Config)) != 0) goto fail;
+    if (magic != 0x4D475043) goto fail;
+    if (version == 1) {
+        ConfigV1 old = {0};
+        if (fread(&old, sizeof(old), 1, f) != 1) goto fail;
+        ck = (Config){
+            .n_embd = old.n_embd,
+            .n_head = old.n_head,
+            .n_layer = old.n_layer,
+            .block_size = old.block_size,
+            .head_dim = old.head_dim,
+            .vocab_size = old.vocab_size,
+            .norm_kind = NORM_RMS,
+            .tie_embeddings = 0,
+        };
+    } else if (version == 2) {
+        if (fread(&ck, sizeof(ck), 1, f) != 1) goto fail;
+    } else {
+        goto fail;
+    }
+    if (!config_matches(&ck, cfg)) goto fail;
 
     size_t V = (size_t)cfg->vocab_size, E = (size_t)cfg->n_embd, L = (size_t)cfg->n_layer, B = (size_t)cfg->block_size;
     if (fread(w->wte, sizeof(float), V * E, f) != V * E) goto fail;
@@ -1144,6 +1490,70 @@ static bool chat_with_prompt(const Config* cfg, const Weights* w, const char* pr
     return true;
 }
 
+static bool token_chat_with_prompt(const Config* cfg, const Weights* w,
+                                   const int* prompt_tokens, int n_prompt, int stop_token,
+                                   float temperature, int max_new_tokens) {
+    if (n_prompt <= 0) {
+        fprintf(stderr, "error: token prompt is empty\n");
+        return false;
+    }
+    if (max_new_tokens <= 0) {
+        fprintf(stderr, "error: max_new_tokens must be positive\n");
+        return false;
+    }
+
+    int usable = n_prompt;
+    const int* prompt_tail = prompt_tokens;
+    if (usable > cfg->block_size - 1) {
+        prompt_tail += usable - (cfg->block_size - 1);
+        usable = cfg->block_size - 1;
+    }
+
+    float* logits = (float*)malloc((size_t)cfg->vocab_size * sizeof(float));
+    float* probs = (float*)malloc((size_t)cfg->vocab_size * sizeof(float));
+    float* kcache = (float*)calloc((size_t)cfg->n_layer * cfg->block_size * cfg->n_embd, sizeof(float));
+    float* vcache = (float*)calloc((size_t)cfg->n_layer * cfg->block_size * cfg->n_embd, sizeof(float));
+    int* generated = (int*)malloc((size_t)max_new_tokens * sizeof(int));
+    if (!logits || !probs || !kcache || !vcache || !generated) {
+        fprintf(stderr, "error: allocation failed in token chat\n");
+        free(logits);
+        free(probs);
+        free(kcache);
+        free(vcache);
+        free(generated);
+        return false;
+    }
+
+    int token = prompt_tail[0];
+    int pos = 0;
+    for (int i = 1; i < usable; i++) {
+        gpt_infer_step(cfg, w, kcache, vcache, token, pos, logits);
+        token = prompt_tail[i];
+        pos++;
+    }
+
+    int n_generated = 0;
+    while (pos < cfg->block_size - 1 && n_generated < max_new_tokens) {
+        gpt_infer_step(cfg, w, kcache, vcache, token, pos, logits);
+        softmax_forward(logits, probs, cfg->vocab_size, temperature);
+        token = sample_from_probs(probs, cfg->vocab_size);
+        if (stop_token >= 0 && token == stop_token) break;
+        generated[n_generated++] = token;
+        pos++;
+    }
+
+    printf("guppy_token_ids>");
+    for (int i = 0; i < n_generated; i++) printf("%s%d", i == 0 ? " " : " ", generated[i]);
+    putchar('\n');
+
+    free(logits);
+    free(probs);
+    free(kcache);
+    free(vcache);
+    free(generated);
+    return true;
+}
+
 int main(int argc, char** argv) {
     srand(42);  // align with Python gist
 
@@ -1167,6 +1577,11 @@ int main(int argc, char** argv) {
         const char* dataset_path = (argc > 3) ? argv[3] : "guppy_input.txt";
         const char* ckpt_path = (argc > 4) ? argv[4] : "ckpt_best.bin";
         float temperature = (argc > 5) ? atof(argv[5]) : 0.7f;
+
+        if (path_has_suffix(dataset_path, ".bin")) {
+            fprintf(stderr, "error: chat expects a text dataset; use token-chat or scripts/chat_guppy_bpe.py\n");
+            return 1;
+        }
 
         char** docs = NULL;
         int n_docs = 0;
@@ -1205,29 +1620,100 @@ int main(int argc, char** argv) {
         return ok ? 0 : 1;
     }
 
-    char** docs = NULL;
-    int n_docs = 0;
+    if (argc > 1 && strcmp(argv[1], "token-chat") == 0) {
+        const char* prompt_ids_text = (argc > 2) ? argv[2] : "";
+        const char* dataset_path = (argc > 3) ? argv[3] : "data/guppy_bpe/train.bin";
+        const char* ckpt_path = (argc > 4) ? argv[4] : "ckpt_best.bin";
+        float temperature = (argc > 5) ? atof(argv[5]) : 0.7f;
+        int max_new_tokens = (argc > 6) ? atoi(argv[6]) : 64;
+
+        if (!path_has_suffix(dataset_path, ".bin")) {
+            fprintf(stderr, "error: token-chat expects a train.bin dataset path\n");
+            return 1;
+        }
+
+        TokenCorpus token_corpus = {0};
+        if (!load_token_corpus(dataset_path, &token_corpus)) {
+            fprintf(stderr, "error: failed to load token corpus from %s\n", dataset_path);
+            return 1;
+        }
+
+        Config cfg = {0};
+        if (!load_checkpoint_config(ckpt_path, &cfg)) {
+            fprintf(stderr, "error: failed to read checkpoint config from %s\n", ckpt_path);
+            free_token_corpus(&token_corpus);
+            return 1;
+        }
+        cfg.vocab_size = token_corpus.vocab_size;
+
+        int max_prompt_tokens = (int)strlen(prompt_ids_text) + 1;
+        int* prompt_ids = (int*)malloc((size_t)max_prompt_tokens * sizeof(int));
+        if (!prompt_ids) {
+            fprintf(stderr, "error: failed to allocate prompt buffer\n");
+            free_token_corpus(&token_corpus);
+            return 1;
+        }
+        int n_prompt = parse_token_id_list(prompt_ids_text, cfg.vocab_size, prompt_ids, max_prompt_tokens);
+        if (n_prompt <= 0) {
+            fprintf(stderr, "error: failed to parse prompt token ids\n");
+            free(prompt_ids);
+            free_token_corpus(&token_corpus);
+            return 1;
+        }
+
+        Weights w = {0};
+        alloc_weights(&cfg, &w);
+        if (!load_checkpoint(ckpt_path, &cfg, &w)) {
+            fprintf(stderr, "error: failed to load checkpoint %s\n", ckpt_path);
+            free_weights(&w);
+            free(prompt_ids);
+            free_token_corpus(&token_corpus);
+            return 1;
+        }
+
+        bool ok = token_chat_with_prompt(&cfg, &w, prompt_ids, n_prompt, token_corpus.end_id, temperature, max_new_tokens);
+        free_weights(&w);
+        free(prompt_ids);
+        free_token_corpus(&token_corpus);
+        return ok ? 0 : 1;
+    }
+
     const char* dataset_path = "input.txt";
     if (argc > 11) dataset_path = argv[11];
+    bool token_mode = path_has_suffix(dataset_path, ".bin");
 
-    if (strcmp(dataset_path, "input.txt") == 0 && !ensure_input_file()) {
+    char** docs = NULL;
+    int n_docs = 0;
+    TokenCorpus token_corpus = {0};
+
+    if (!token_mode && strcmp(dataset_path, "input.txt") == 0 && !ensure_input_file()) {
         fprintf(stderr, "warning: input.txt missing and auto-download failed, using tiny fallback corpus\n");
     }
-    if (!load_lines(dataset_path, &docs, &n_docs)) {
+    if (token_mode) {
+        if (!load_token_corpus(dataset_path, &token_corpus)) {
+            fprintf(stderr, "error: failed to load token corpus from %s\n", dataset_path);
+            return 1;
+        }
+    } else if (!load_lines(dataset_path, &docs, &n_docs)) {
         static const char* fallback[] = {"anna", "bob", "carol", "david", "emma", "frank"};
         n_docs = (int)(sizeof(fallback) / sizeof(fallback[0]));
         docs = (char**)malloc((size_t)n_docs * sizeof(char*));
         for (int i = 0; i < n_docs; i++) docs[i] = strdup(fallback[i]);
     }
-    shuffle_lines(docs, n_docs);
+    if (!token_mode) shuffle_lines(docs, n_docs);
 
     char id_to_char[256] = {0};
     int char_to_id[256];
     for (int i = 0; i < 256; i++) char_to_id[i] = -1;
 
     int vocab_size = 0;
-    build_vocab(docs, n_docs, id_to_char, &vocab_size, char_to_id);
-    int BOS = vocab_size - 1;
+    int BOS = -1;
+    if (!token_mode) {
+        build_vocab(docs, n_docs, id_to_char, &vocab_size, char_to_id);
+        BOS = vocab_size - 1;
+    } else {
+        vocab_size = token_corpus.vocab_size;
+    }
 
     int num_steps = 500;
     float temperature = 0.5f;
@@ -1239,6 +1725,8 @@ int main(int argc, char** argv) {
     int n_head = 4;
     int n_layer = 2;
     int block_size = 16;
+    int norm_kind = NORM_RMS;
+    int tie_embeddings = 0;
     if (argc > 1) num_steps = atoi(argv[1]);
     if (argc > 2) temperature = atof(argv[2]);
     if (argc > 3) num_samples = atoi(argv[3]);
@@ -1250,6 +1738,18 @@ int main(int argc, char** argv) {
     if (argc > 9) block_size = atoi(argv[9]);
     if (argc > 10) learning_rate = atof(argv[10]);
     const char* chat_prompt = (argc > 12) ? argv[12] : NULL;
+
+    if (token_mode) {
+        norm_kind = NORM_LAYER;
+        tie_embeddings = 1;
+        if (block_size < 128) block_size = 128;
+        if (learning_rate > 1e-3f) learning_rate = 1e-3f;
+    } else if (dataset_looks_like_chat(docs, n_docs)) {
+        norm_kind = NORM_LAYER;
+        tie_embeddings = 1;
+        if (block_size < 128) block_size = 128;
+        if (learning_rate > 1e-3f) learning_rate = 1e-3f;
+    }
 
     if (n_embd <= 0 || n_head <= 0 || n_layer <= 0 || block_size <= 0) {
         fprintf(stderr, "error: n_embd, n_head, n_layer, block_size must be positive\n");
@@ -1271,6 +1771,8 @@ int main(int argc, char** argv) {
         .block_size = block_size,
         .head_dim = n_embd / n_head,
         .vocab_size = vocab_size,
+        .norm_kind = norm_kind,
+        .tie_embeddings = tie_embeddings,
     };
 
     Weights w = {0};
@@ -1287,20 +1789,30 @@ int main(int argc, char** argv) {
     TrainCache cache = {0};
     alloc_train_cache(&cfg, &cache);
 
-    printf("num docs: %d\n", n_docs);
     printf("dataset: %s\n", dataset_path);
+    if (token_mode) {
+        printf("token mode: train_tokens=%zu val_tokens=%zu\n",
+               token_corpus.n_train_tokens, token_corpus.n_val_tokens);
+    } else {
+        printf("num docs: %d\n", n_docs);
+    }
     printf("vocab size: %d\n", cfg.vocab_size);
-    printf("model: n_embd=%d n_head=%d n_layer=%d block_size=%d lr=%.6f\n",
-           cfg.n_embd, cfg.n_head, cfg.n_layer, cfg.block_size, learning_rate);
+    printf("model: n_embd=%d n_head=%d n_layer=%d block_size=%d lr=%.6f norm=%s tied_embeddings=%s\n",
+           cfg.n_embd, cfg.n_head, cfg.n_layer, cfg.block_size, learning_rate,
+           norm_kind_name(cfg.norm_kind), cfg.tie_embeddings ? "yes" : "no");
     printf("num params: %zu\n", param_count(&cfg));
 
     float beta1 = 0.9f, beta2 = 0.95f, eps_adam = 1e-8f;
-    int n_val = n_docs / 10;
-    if (n_docs > 1 && n_val < 1) n_val = 1;
-    if (n_docs > 1 && n_val >= n_docs) n_val = n_docs - 1;
-    if (n_docs <= 1) n_val = 0;
-    int n_train = n_docs - n_val;
-    printf("train docs: %d | val docs: %d\n", n_train, n_val);
+    int n_val = 0;
+    int n_train = 0;
+    if (!token_mode) {
+        n_val = n_docs / 10;
+        if (n_docs > 1 && n_val < 1) n_val = 1;
+        if (n_docs > 1 && n_val >= n_docs) n_val = n_docs - 1;
+        if (n_docs <= 1) n_val = 0;
+        n_train = n_docs - n_val;
+        printf("train docs: %d | val docs: %d\n", n_train, n_val);
+    }
     int* toks = (int*)malloc((size_t)(cfg.block_size + 2) * sizeof(int));
 
     float* losses = (float*)malloc((size_t)num_steps * sizeof(float));
@@ -1311,8 +1823,11 @@ int main(int argc, char** argv) {
     struct timespec t0 = {0}, t1 = {0};
     clock_gettime(CLOCK_MONOTONIC, &t0);
     for (int step = 0; step < num_steps; step++) {
-        int idx = rand() % n_train;
-        prepare_example(docs[idx], BOS, char_to_id, cfg.block_size, toks, &cache);
+        if (token_mode) prepare_token_example(token_corpus.train_tokens, token_corpus.n_train_tokens, cfg.block_size, &cache);
+        else {
+            int idx = rand() % n_train;
+            prepare_example(docs[idx], BOS, char_to_id, cfg.block_size, toks, &cache);
+        }
 
         zero_grads(&cfg, &g);
         float loss = forward_sequence(&cfg, &w, &cache);
@@ -1326,12 +1841,16 @@ int main(int argc, char** argv) {
 
         bool do_eval = ((step + 1) % eval_interval == 0) || (step + 1 == num_steps);
         if (do_eval) {
-            float train_eval = eval_split_loss(&cfg, &w, &cache, docs, 0, n_train, BOS, char_to_id, toks, eval_iters);
-            float val_eval = (n_val > 0) ? eval_split_loss(&cfg, &w, &cache, docs, n_train, n_val, BOS, char_to_id, toks, eval_iters) : NAN;
+            float train_eval = token_mode
+                ? eval_token_loss(&cfg, &w, &cache, token_corpus.train_tokens, token_corpus.n_train_tokens, eval_iters)
+                : eval_split_loss(&cfg, &w, &cache, docs, 0, n_train, BOS, char_to_id, toks, eval_iters);
+            float val_eval = token_mode
+                ? eval_token_loss(&cfg, &w, &cache, token_corpus.val_tokens, token_corpus.n_val_tokens, eval_iters)
+                : ((n_val > 0) ? eval_split_loss(&cfg, &w, &cache, docs, n_train, n_val, BOS, char_to_id, toks, eval_iters) : NAN);
             printf("eval step %4d | train %.4f | val %.4f | lr %.6f\n", step + 1, train_eval, val_eval, lr_t);
             if (ef) fprintf(ef, "%d,%.8f,%.8f,%.8f\n", step + 1, train_eval, val_eval, lr_t);
 
-            float metric = (n_val > 0) ? val_eval : train_eval;
+            float metric = token_mode ? val_eval : ((n_val > 0) ? val_eval : train_eval);
             if (metric < best_val) {
                 best_val = metric;
                 if (save_checkpoint(best_ckpt, &cfg, &w)) {
@@ -1359,7 +1878,10 @@ int main(int argc, char** argv) {
     }
 
     printf("\n--- inference ---\n");
-    if (chat_prompt && chat_prompt[0] != '\0') {
+    if (token_mode) {
+        printf("token-mode training complete.\n");
+        printf("use scripts/prepare_guppy_bpe.py tokenizer.json to decode future token samples.\n");
+    } else if (chat_prompt && chat_prompt[0] != '\0') {
         chat_with_prompt(&cfg, &w, chat_prompt, temperature, id_to_char, char_to_id, BOS);
     } else {
         float* logits = (float*)malloc((size_t)cfg.vocab_size * sizeof(float));
@@ -1395,6 +1917,7 @@ int main(int argc, char** argv) {
     free_adam(&m2);
     free_grads(&g);
     free_weights(&w);
-    free_lines(docs, n_docs);
+    if (token_mode) free_token_corpus(&token_corpus);
+    else free_lines(docs, n_docs);
     return 0;
 }
