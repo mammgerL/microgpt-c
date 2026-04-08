@@ -38,6 +38,51 @@ make
 
 请将语料放在当前目录的 `input.txt` 中（每行一条样本）。
 
+## Guppy Mode
+
+当前版本加入了一个受 `guppylm` 启发的最小 C 版功能集：
+
+- 生成单轮鱼人格聊天语料
+- 用现有字符级训练器训练聊天格式样本
+- 训练后基于用户 prompt 做单轮回复
+
+生成语料：
+
+```bash
+./microgpt_mac guppy-data                 # 生成 guppy_input.txt（默认 60000 条）
+./microgpt_mac guppy-data my_guppy.txt 5000
+```
+
+生成的每一行样本格式为：
+
+```text
+<|user|> hi guppy <|assistant|> hello. the water feels nice today. <|end|>
+```
+
+训练 Guppy 语料：
+
+```bash
+./microgpt_mac 500 0.7 3 250 50 64 4 2 128 0.001 guppy_input.txt
+```
+
+训练后直接给一个 prompt：
+
+```bash
+./microgpt_mac 500 0.7 3 250 50 64 4 2 128 0.001 guppy_input.txt "hi guppy"
+```
+
+只使用已有 checkpoint 聊天：
+
+```bash
+./microgpt_mac chat "tell me a joke" guppy_input.txt ckpt_best.bin 0.7
+```
+
+说明：
+
+- 这是在当前字符级 C 训练器上的第一版 Guppy 功能迁移，不是 `guppylm` 的完整复刻。
+- 当前没有移植 BPE tokenizer、batch 训练、ONNX 导出和浏览器推理。
+- 要得到更像样的聊天输出，通常需要更长训练步数和更大的 `block_size`。
+
 ## 说明
 
 - 当前默认实验配置：`n_embd=32`, `n_head=4`, `n_layer=2`, `block_size=16`, `learning_rate=3e-3`。

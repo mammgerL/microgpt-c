@@ -1,4 +1,5 @@
 #include <Accelerate/Accelerate.h>
+#include <ctype.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -83,6 +84,10 @@ typedef struct {
 
     float* attn_probs;    // [L, n, H, n]
 } TrainCache;
+
+static const char* kChatUserTag = "<|user|>";
+static const char* kChatAssistantTag = "<|assistant|>";
+static const char* kChatEndTag = "<|end|>";
 
 static float rand_uniform(void) {
     return (float)rand() / (float)RAND_MAX;
@@ -170,6 +175,188 @@ static void shuffle_lines(char** lines, int n) {
         lines[i] = lines[j];
         lines[j] = tmp;
     }
+}
+
+static const char* pick_str(const char* const* items, int count) {
+    return items[rand() % count];
+}
+
+static void sanitize_chat_text(const char* src, char* dst, size_t dst_sz) {
+    size_t j = 0;
+    for (size_t i = 0; src[i] != '\0' && j + 1 < dst_sz; i++) {
+        unsigned char ch = (unsigned char)src[i];
+        if (ch == '\n' || ch == '\r' || ch == '\t') ch = ' ';
+        dst[j++] = (char)tolower(ch);
+    }
+    dst[j] = '\0';
+}
+
+static void format_chat_prompt(const char* user_input, char* out, size_t out_sz) {
+    char clean[512];
+    sanitize_chat_text(user_input, clean, sizeof(clean));
+    snprintf(out, out_sz, "%s %s %s", kChatUserTag, clean, kChatAssistantTag);
+}
+
+static void truncate_to_tail(const char* src, int max_chars, char* out, size_t out_sz) {
+    size_t len = strlen(src);
+    const char* tail = src;
+    if ((int)len > max_chars) tail = src + (len - (size_t)max_chars);
+    snprintf(out, out_sz, "%s", tail);
+}
+
+static void build_guppy_sample(char* out, size_t out_sz) {
+    static const char* const greetings[] = {
+        "hi guppy", "hello little fish", "good morning guppy", "hey fish", "hi tiny swimmer"
+    };
+    static const char* const greeting_replies[] = {
+        "hello. the water feels nice today.",
+        "hi. i was looking at the light.",
+        "hello friend. i am doing slow circles.",
+        "hi there. i found a good bubble spot.",
+        "hello. my fins are ready for the day."
+    };
+    static const char* const food_prompts[] = {
+        "are you hungry", "do you want food", "what do you eat", "is it snack time", "are you thinking about food"
+    };
+    static const char* const foods[] = {
+        "flakes", "tiny pellets", "brine shrimp", "crumbly food", "little floating snacks"
+    };
+    static const char* const bubble_prompts[] = {
+        "do you like bubbles", "what do bubbles feel like", "are the bubbles loud", "why are you following bubbles"
+    };
+    static const char* const bubble_replies[] = {
+        "i love bubbles. they tickle the water.",
+        "bubbles feel funny on my face.",
+        "i follow them because they go up and i do not.",
+        "the bubbles sound busy but friendly."
+    };
+    static const char* const light_prompts[] = {
+        "is the light too bright", "do you like the light", "what do you think about the lamp", "why are you near the light"
+    };
+    static const char* const light_things[] = {
+        "lamp", "bright top light", "morning light", "soft light", "glass shine"
+    };
+    static const char* const sleep_prompts[] = {
+        "are you sleepy", "goodnight guppy", "do fish sleep", "why are you so still"
+    };
+    static const char* const sleep_places[] = {
+        "plant", "corner", "rock", "filter shadow", "warm side of the tank"
+    };
+    static const char* const cat_prompts[] = {
+        "the cat is looking at you", "are you scared of the cat", "what do you think about the furry thing", "did the cat come back"
+    };
+    static const char* const rain_prompts[] = {
+        "it is raining outside", "do you know what rain is", "can you hear the rain", "is rain scary"
+    };
+    static const char* const joke_prompts[] = {
+        "tell me a joke", "say something funny", "do fish know jokes", "make me laugh"
+    };
+    static const char* const joke_lines[] = {
+        "what did the fish say when it hit the wall. dam.",
+        "i told the snail a joke. it laughed very slowly.",
+        "my best joke is still about food.",
+        "i am funny when i miss the pellet and pretend i did not."
+    };
+    static const char* const love_prompts[] = {
+        "do you love me", "am i your friend", "do you like me", "are we friends"
+    };
+    static const char* const meaning_prompts[] = {
+        "what is the meaning of life", "why are we here", "what matters most", "what is important to you"
+    };
+    static const char* const reflection_prompts[] = {
+        "is that you in the glass", "why do you look at your reflection", "do you know the fish in the glass"
+    };
+    static const char* const music_prompts[] = {
+        "do you like music", "can fish hear songs", "what do you think about this music"
+    };
+    static const char* const lonely_prompts[] = {
+        "are you lonely", "do you need a friend", "do you get bored"
+    };
+    static const char* const weather_prompts[] = {
+        "is it warm today", "how does the water feel", "do you like cold water", "what is the tank like today"
+    };
+
+    const char* user = "hi guppy";
+    char assistant[512];
+    int topic = rand() % 12;
+    switch (topic) {
+        case 0:
+            user = pick_str(greetings, (int)(sizeof(greetings) / sizeof(greetings[0])));
+            snprintf(assistant, sizeof(assistant), "%s",
+                     pick_str(greeting_replies, (int)(sizeof(greeting_replies) / sizeof(greeting_replies[0]))));
+            break;
+        case 1:
+            user = pick_str(food_prompts, (int)(sizeof(food_prompts) / sizeof(food_prompts[0])));
+            snprintf(assistant, sizeof(assistant), "yes. always yes. i am thinking about %s right now.",
+                     pick_str(foods, (int)(sizeof(foods) / sizeof(foods[0]))));
+            break;
+        case 2:
+            user = pick_str(bubble_prompts, (int)(sizeof(bubble_prompts) / sizeof(bubble_prompts[0])));
+            snprintf(assistant, sizeof(assistant), "%s",
+                     pick_str(bubble_replies, (int)(sizeof(bubble_replies) / sizeof(bubble_replies[0]))));
+            break;
+        case 3:
+            user = pick_str(light_prompts, (int)(sizeof(light_prompts) / sizeof(light_prompts[0])));
+            snprintf(assistant, sizeof(assistant), "the %s is nice when it is not too sharp. i like to float under it.",
+                     pick_str(light_things, (int)(sizeof(light_things) / sizeof(light_things[0]))));
+            break;
+        case 4:
+            user = pick_str(sleep_prompts, (int)(sizeof(sleep_prompts) / sizeof(sleep_prompts[0])));
+            snprintf(assistant, sizeof(assistant), "when i get sleepy i hide by the %s and move only a little.",
+                     pick_str(sleep_places, (int)(sizeof(sleep_places) / sizeof(sleep_places[0]))));
+            break;
+        case 5:
+            user = pick_str(cat_prompts, (int)(sizeof(cat_prompts) / sizeof(cat_prompts[0])));
+            snprintf(assistant, sizeof(assistant), "i do not trust the furry one. i stay close to the plant when it stares.");
+            break;
+        case 6:
+            user = pick_str(rain_prompts, (int)(sizeof(rain_prompts) / sizeof(rain_prompts[0])));
+            snprintf(assistant, sizeof(assistant), "rain sounds soft from inside the tank. it makes outside feel far away.");
+            break;
+        case 7:
+            user = pick_str(joke_prompts, (int)(sizeof(joke_prompts) / sizeof(joke_prompts[0])));
+            snprintf(assistant, sizeof(assistant), "%s",
+                     pick_str(joke_lines, (int)(sizeof(joke_lines) / sizeof(joke_lines[0]))));
+            break;
+        case 8:
+            user = pick_str(love_prompts, (int)(sizeof(love_prompts) / sizeof(love_prompts[0])));
+            snprintf(assistant, sizeof(assistant), "yes. you are my favorite big shape outside the glass.");
+            break;
+        case 9:
+            user = pick_str(meaning_prompts, (int)(sizeof(meaning_prompts) / sizeof(meaning_prompts[0])));
+            snprintf(assistant, sizeof(assistant), "food first. bubbles second. after that i will think more.");
+            break;
+        case 10:
+            user = pick_str(reflection_prompts, (int)(sizeof(reflection_prompts) / sizeof(reflection_prompts[0])));
+            snprintf(assistant, sizeof(assistant), "the glass fish copies me. i still have questions about that.");
+            break;
+        default:
+            if (rand() & 1) {
+                user = pick_str(music_prompts, (int)(sizeof(music_prompts) / sizeof(music_prompts[0])));
+                snprintf(assistant, sizeof(assistant), "some music feels like tiny waves. i like the slow kind.");
+            } else if (rand() & 1) {
+                user = pick_str(lonely_prompts, (int)(sizeof(lonely_prompts) / sizeof(lonely_prompts[0])));
+                snprintf(assistant, sizeof(assistant), "sometimes i watch the snails when the tank feels quiet.");
+            } else {
+                user = pick_str(weather_prompts, (int)(sizeof(weather_prompts) / sizeof(weather_prompts[0])));
+                snprintf(assistant, sizeof(assistant), "the water feels calm and a little warm. that is a good tank day.");
+            }
+            break;
+    }
+
+    snprintf(out, out_sz, "%s %s %s %s %s", kChatUserTag, user, kChatAssistantTag, assistant, kChatEndTag);
+}
+
+static bool write_guppy_dataset(const char* path, int n_samples) {
+    FILE* f = fopen(path, "w");
+    if (!f) return false;
+    char line[1024];
+    for (int i = 0; i < n_samples; i++) {
+        build_guppy_sample(line, sizeof(line));
+        fprintf(f, "%s\n", line);
+    }
+    fclose(f);
+    return true;
 }
 
 static int prepare_example(const char* doc, int BOS, const int* char_to_id, int block_size, int* toks, TrainCache* cache) {
@@ -858,6 +1045,20 @@ fail:
     return false;
 }
 
+static bool load_checkpoint_config(const char* path, Config* out_cfg) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+    uint32_t magic = 0, version = 0;
+    bool ok = false;
+    if (fread(&magic, sizeof(magic), 1, f) != 1) goto done;
+    if (fread(&version, sizeof(version), 1, f) != 1) goto done;
+    if (fread(out_cfg, sizeof(*out_cfg), 1, f) != 1) goto done;
+    ok = (magic == 0x4D475043 && version == 1);
+done:
+    fclose(f);
+    return ok;
+}
+
 static bool load_checkpoint(const char* path, const Config* cfg, Weights* w) {
     FILE* f = fopen(path, "rb");
     if (!f) return false;
@@ -886,15 +1087,133 @@ fail:
     return false;
 }
 
+static bool chat_with_prompt(const Config* cfg, const Weights* w, const char* prompt, float temperature,
+                             const char* id_to_char, const int* char_to_id, int BOS) {
+    char raw_prefix[1024];
+    char prefix[1024];
+    format_chat_prompt(prompt, raw_prefix, sizeof(raw_prefix));
+    truncate_to_tail(raw_prefix, cfg->block_size - 1, prefix, sizeof(prefix));
+
+    for (size_t i = 0; prefix[i] != '\0'; i++) {
+        if (char_to_id[(unsigned char)prefix[i]] < 0) {
+            fprintf(stderr, "error: prompt contains unsupported character '%c'\n", prefix[i]);
+            return false;
+        }
+    }
+
+    float* logits = (float*)malloc((size_t)cfg->vocab_size * sizeof(float));
+    float* probs = (float*)malloc((size_t)cfg->vocab_size * sizeof(float));
+    float* kcache = (float*)calloc((size_t)cfg->n_layer * cfg->block_size * cfg->n_embd, sizeof(float));
+    float* vcache = (float*)calloc((size_t)cfg->n_layer * cfg->block_size * cfg->n_embd, sizeof(float));
+    char generated[4096];
+    generated[0] = '\0';
+
+    int token = BOS;
+    int pos = 0;
+    for (; prefix[pos] != '\0' && pos < cfg->block_size - 1; pos++) {
+        gpt_infer_step(cfg, w, kcache, vcache, token, pos, logits);
+        token = char_to_id[(unsigned char)prefix[pos]];
+    }
+
+    while (pos < cfg->block_size - 1) {
+        gpt_infer_step(cfg, w, kcache, vcache, token, pos, logits);
+        softmax_forward(logits, probs, cfg->vocab_size, temperature);
+        token = sample_from_probs(probs, cfg->vocab_size);
+        if (token == BOS) break;
+
+        size_t len = strlen(generated);
+        if (len + 2 >= sizeof(generated)) break;
+        generated[len] = id_to_char[token];
+        generated[len + 1] = '\0';
+
+        char* end_tag = strstr(generated, kChatEndTag);
+        if (end_tag) {
+            *end_tag = '\0';
+            break;
+        }
+        pos++;
+    }
+
+    printf("you> %s\n", prompt);
+    printf("guppy> %s\n", generated);
+
+    free(logits);
+    free(probs);
+    free(kcache);
+    free(vcache);
+    return true;
+}
+
 int main(int argc, char** argv) {
     srand(42);  // align with Python gist
 
+    if (argc > 1 && strcmp(argv[1], "guppy-data") == 0) {
+        const char* out_path = (argc > 2) ? argv[2] : "guppy_input.txt";
+        int n_samples = (argc > 3) ? atoi(argv[3]) : 60000;
+        if (n_samples <= 0) {
+            fprintf(stderr, "error: sample count must be positive\n");
+            return 1;
+        }
+        if (!write_guppy_dataset(out_path, n_samples)) {
+            fprintf(stderr, "error: failed to write dataset to %s\n", out_path);
+            return 1;
+        }
+        printf("wrote %d guppy chat samples to %s\n", n_samples, out_path);
+        return 0;
+    }
+
+    if (argc > 1 && strcmp(argv[1], "chat") == 0) {
+        const char* prompt = (argc > 2) ? argv[2] : "hi guppy";
+        const char* dataset_path = (argc > 3) ? argv[3] : "guppy_input.txt";
+        const char* ckpt_path = (argc > 4) ? argv[4] : "ckpt_best.bin";
+        float temperature = (argc > 5) ? atof(argv[5]) : 0.7f;
+
+        char** docs = NULL;
+        int n_docs = 0;
+        if (!load_lines(dataset_path, &docs, &n_docs)) {
+            fprintf(stderr, "error: failed to load dataset file %s\n", dataset_path);
+            return 1;
+        }
+
+        char id_to_char[256] = {0};
+        int char_to_id[256];
+        for (int i = 0; i < 256; i++) char_to_id[i] = -1;
+        int vocab_size = 0;
+        build_vocab(docs, n_docs, id_to_char, &vocab_size, char_to_id);
+        int BOS = vocab_size - 1;
+
+        Config cfg = {0};
+        if (!load_checkpoint_config(ckpt_path, &cfg)) {
+            fprintf(stderr, "error: failed to read checkpoint config from %s\n", ckpt_path);
+            free_lines(docs, n_docs);
+            return 1;
+        }
+        cfg.vocab_size = vocab_size;
+
+        Weights w = {0};
+        alloc_weights(&cfg, &w);
+        if (!load_checkpoint(ckpt_path, &cfg, &w)) {
+            fprintf(stderr, "error: failed to load checkpoint %s\n", ckpt_path);
+            free_weights(&w);
+            free_lines(docs, n_docs);
+            return 1;
+        }
+
+        bool ok = chat_with_prompt(&cfg, &w, prompt, temperature, id_to_char, char_to_id, BOS);
+        free_weights(&w);
+        free_lines(docs, n_docs);
+        return ok ? 0 : 1;
+    }
+
     char** docs = NULL;
     int n_docs = 0;
-    if (!ensure_input_file()) {
+    const char* dataset_path = "input.txt";
+    if (argc > 11) dataset_path = argv[11];
+
+    if (strcmp(dataset_path, "input.txt") == 0 && !ensure_input_file()) {
         fprintf(stderr, "warning: input.txt missing and auto-download failed, using tiny fallback corpus\n");
     }
-    if (!load_lines("input.txt", &docs, &n_docs)) {
+    if (!load_lines(dataset_path, &docs, &n_docs)) {
         static const char* fallback[] = {"anna", "bob", "carol", "david", "emma", "frank"};
         n_docs = (int)(sizeof(fallback) / sizeof(fallback[0]));
         docs = (char**)malloc((size_t)n_docs * sizeof(char*));
@@ -930,6 +1249,7 @@ int main(int argc, char** argv) {
     if (argc > 8) n_layer = atoi(argv[8]);
     if (argc > 9) block_size = atoi(argv[9]);
     if (argc > 10) learning_rate = atof(argv[10]);
+    const char* chat_prompt = (argc > 12) ? argv[12] : NULL;
 
     if (n_embd <= 0 || n_head <= 0 || n_layer <= 0 || block_size <= 0) {
         fprintf(stderr, "error: n_embd, n_head, n_layer, block_size must be positive\n");
@@ -968,6 +1288,7 @@ int main(int argc, char** argv) {
     alloc_train_cache(&cfg, &cache);
 
     printf("num docs: %d\n", n_docs);
+    printf("dataset: %s\n", dataset_path);
     printf("vocab size: %d\n", cfg.vocab_size);
     printf("model: n_embd=%d n_head=%d n_layer=%d block_size=%d lr=%.6f\n",
            cfg.n_embd, cfg.n_head, cfg.n_layer, cfg.block_size, learning_rate);
@@ -1038,31 +1359,35 @@ int main(int argc, char** argv) {
     }
 
     printf("\n--- inference ---\n");
-    float* logits = (float*)malloc((size_t)cfg.vocab_size * sizeof(float));
-    float* probs = (float*)malloc((size_t)cfg.vocab_size * sizeof(float));
-    float* kcache = (float*)calloc((size_t)cfg.n_layer * cfg.block_size * cfg.n_embd, sizeof(float));
-    float* vcache = (float*)calloc((size_t)cfg.n_layer * cfg.block_size * cfg.n_embd, sizeof(float));
+    if (chat_prompt && chat_prompt[0] != '\0') {
+        chat_with_prompt(&cfg, &w, chat_prompt, temperature, id_to_char, char_to_id, BOS);
+    } else {
+        float* logits = (float*)malloc((size_t)cfg.vocab_size * sizeof(float));
+        float* probs = (float*)malloc((size_t)cfg.vocab_size * sizeof(float));
+        float* kcache = (float*)calloc((size_t)cfg.n_layer * cfg.block_size * cfg.n_embd, sizeof(float));
+        float* vcache = (float*)calloc((size_t)cfg.n_layer * cfg.block_size * cfg.n_embd, sizeof(float));
 
-    for (int s = 0; s < num_samples; s++) {
-        memset(kcache, 0, (size_t)cfg.n_layer * cfg.block_size * cfg.n_embd * sizeof(float));
-        memset(vcache, 0, (size_t)cfg.n_layer * cfg.block_size * cfg.n_embd * sizeof(float));
+        for (int s = 0; s < num_samples; s++) {
+            memset(kcache, 0, (size_t)cfg.n_layer * cfg.block_size * cfg.n_embd * sizeof(float));
+            memset(vcache, 0, (size_t)cfg.n_layer * cfg.block_size * cfg.n_embd * sizeof(float));
 
-        int token = BOS;
-        printf("sample %2d: ", s + 1);
-        for (int pos = 0; pos < cfg.block_size; pos++) {
-            gpt_infer_step(&cfg, &w, kcache, vcache, token, pos, logits);
-            softmax_forward(logits, probs, cfg.vocab_size, temperature);
-            token = sample_from_probs(probs, cfg.vocab_size);
-            if (token == BOS) break;
-            putchar(id_to_char[token]);
+            int token = BOS;
+            printf("sample %2d: ", s + 1);
+            for (int pos = 0; pos < cfg.block_size; pos++) {
+                gpt_infer_step(&cfg, &w, kcache, vcache, token, pos, logits);
+                softmax_forward(logits, probs, cfg.vocab_size, temperature);
+                token = sample_from_probs(probs, cfg.vocab_size);
+                if (token == BOS) break;
+                putchar(id_to_char[token]);
+            }
+            putchar('\n');
         }
-        putchar('\n');
-    }
 
-    free(logits);
-    free(probs);
-    free(kcache);
-    free(vcache);
+        free(logits);
+        free(probs);
+        free(kcache);
+        free(vcache);
+    }
     free(toks);
 
     free_train_cache(&cache);
