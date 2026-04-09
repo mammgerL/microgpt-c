@@ -2,6 +2,8 @@
 
 这是一个C版本的minigpt，并使用 macOS `Accelerate` 做计算加速。
 
+当前和 `guppylm` 对齐的推进说明，见 [GUPPY_NEXT_STEPS.md](/Users/jun/ai/train/microgpt-c/GUPPY_NEXT_STEPS.md)。
+
 ## 已实现功能
 
 - 从 `input.txt`（每行一条样本）构建字符级 tokenizer/vocab（含 `BOS`）。
@@ -46,6 +48,7 @@ make
 - 用现有字符级训练器训练聊天格式样本
 - 训练后基于用户 prompt 做单轮回复
 - 对聊天语料自动启用更接近 `guppylm` 的模型配置：`LayerNorm + tied embeddings`
+- 聊天和 token 模式默认改用更接近原项目的 `ReLU + dropout`
 
 生成语料：
 
@@ -89,7 +92,7 @@ make
 
 - 这是在当前字符级 C 训练器上的第一版 Guppy 功能迁移，不是 `guppylm` 的完整复刻。
 - 当前已经迁入的关键点：聊天数据格式、单轮 prompt 推理、`LayerNorm`、`tied embeddings`。
-- 当前还没有移植：BPE tokenizer、batch 训练、dropout、ONNX 导出和浏览器推理。
+- 当前还没有移植：纯 C BPE tokenizer、ONNX 导出和浏览器推理。
 - 要得到更像样的聊天输出，通常需要更长训练步数和更大的 `block_size`。
 
 ## Guppy BPE Mode
@@ -104,6 +107,10 @@ make
   - `meta.json`
   - `tokenizer.json`
 - C 训练器直接读取 `train.bin` 做 token-stream 训练
+- BPE special tokens 和 prompt 格式已经改成和原项目同一套：
+  - `<pad>`
+  - `<|im_start|>`
+  - `<|im_end|>`
 
 准备依赖：
 
@@ -126,7 +133,7 @@ python3 scripts/prepare_guppy_bpe.py --out-dir data/guppy_bpe --samples 60000 --
 用训练好的 checkpoint 聊天：
 
 ```bash
-python3 scripts/chat_guppy_bpe.py "tell me a joke" --data-dir data/guppy_bpe --ckpt ckpt_best.bin
+./microgpt_mac chat "tell me a joke" data/guppy_bpe/train.bin ckpt_best.bin 0.7
 ```
 
 当 `dataset_path` 是 `train.bin` 时，程序会自动：
@@ -134,12 +141,99 @@ python3 scripts/chat_guppy_bpe.py "tell me a joke" --data-dir data/guppy_bpe --c
 - 从同目录推断 `eval.bin` 和 `meta.json`
 - 读取 `u16` token 流
 - 启用 token-stream 随机窗口采样
-- 使用 `LayerNorm + tied embeddings`
+- 使用 `LayerNorm + tied embeddings + ReLU + dropout`
 
 当前限制：
 
 - `tokenizer.json` 的编码/解码仍在 Python 侧
-- C 核心现在能按 token id 采样，但自然语言聊天仍通过 `scripts/chat_guppy_bpe.py` 包一层
+- `chat` 命令已经能直接对 `.bin` 数据集聊天，但底层仍会调用 Python 脚本做 BPE 编码/解码
+- 如果你之前已经生成过 `data/guppy_bpe` 或 `data/guppy_hf`，在这次格式对齐后需要重新生成一次
+
+## 原版 Guppy 数据
+
+如果你想尽量贴近原项目，可以直接下载原作者公开的 60K 数据集，再转成当前 C 训练器能吃的格式。
+
+准备依赖：
+
+```bash
+python3 -m pip install --user datasets tokenizers
+```
+
+准备原版数据：
+
+```bash
+python3 scripts/prepare_guppy_hf.py --out-dir data/guppy_hf --vocab-size 4096
+```
+
+这会下载 `arman-bd/guppylm-60k-generic`，再导出：
+
+- `train.txt`
+- `eval.txt`
+- `train.bin`
+- `eval.bin`
+- `tokenizer.json`
+- `meta.json`
+
+如果你要尽量对齐原项目的模型大小，可以用这一组参数：
+
+```bash
+MICROGPT_BATCH_SIZE=32 MICROGPT_ACT=relu MICROGPT_DROPOUT=0.1 MICROGPT_FFN_DIM=768 \
+./microgpt_mac 10000 0.7 1 200 50 384 6 6 128 0.0003 data/guppy_hf/train.bin
+```
+
+这一组配置对应：
+
+- `n_embd=384`
+- `n_head=6`
+- `n_layer=6`
+- `ffn_dim=768`
+- `block_size=128`
+- `BPE vocab=4096`
+
+也就是和原项目 README 里写的参数基本对齐。
+
+## 自动测例
+
+项目里现在有一个固定测例脚本，用来盯住“像不像 Guppy”。
+
+运行方式：
+
+```bash
+python3 scripts/eval_guppy.py --dataset data/guppy_hf/train.bin --ckpt ckpt_best.bin
+```
+
+它会：
+
+- 跑一组固定 prompt
+- 抓取 `guppy>` 输出
+- 用关键词命中和基本风格规则给出一个粗分
+
+这个分数不是什么标准 benchmark，但很适合拿来比较不同训练配置有没有往原项目的风格靠近。
+
+## 训练开关
+
+当前版本加了三个环境变量，便于做更像真实训练的实验，不用再改一堆位置参数：
+
+```bash
+MICROGPT_BATCH_SIZE=8
+MICROGPT_ACT=relu
+MICROGPT_DROPOUT=0.1
+MICROGPT_FFN_DIM=256
+```
+
+例子：
+
+```bash
+MICROGPT_BATCH_SIZE=8 MICROGPT_ACT=gelu MICROGPT_DROPOUT=0.1 \
+./microgpt_mac 1000 0.7 1 200 50 64 4 2 128 0.001 data/guppy_bpe/train.bin
+```
+
+说明：
+
+- `MICROGPT_BATCH_SIZE` 用梯度累积做 mini-batch，默认 `1`
+- `MICROGPT_ACT` 可选 `relu2`、`relu`、`gelu`
+- `MICROGPT_DROPOUT` 范围是 `[0, 1)`，默认名字任务是 `0`，聊天和 token 模式默认会切到 `0.1`
+- `MICROGPT_FFN_DIM` 控制 MLP 隐层宽度；聊天和 token 模式默认会切到 `2 * n_embd`，更接近原项目
 
 ## 说明
 

@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -16,8 +17,11 @@ typedef struct {
     int block_size;
     int head_dim;
     int vocab_size;
+    int ffn_dim;
     int norm_kind;
     int tie_embeddings;
+    int act_kind;
+    float dropout_p;
 } Config;
 
 typedef struct {
@@ -29,9 +33,39 @@ typedef struct {
     int vocab_size;
 } ConfigV1;
 
+typedef struct {
+    int n_embd;
+    int n_head;
+    int n_layer;
+    int block_size;
+    int head_dim;
+    int vocab_size;
+    int norm_kind;
+    int tie_embeddings;
+} ConfigV2;
+
+typedef struct {
+    int n_embd;
+    int n_head;
+    int n_layer;
+    int block_size;
+    int head_dim;
+    int vocab_size;
+    int norm_kind;
+    int tie_embeddings;
+    int act_kind;
+    float dropout_p;
+} ConfigV3;
+
 enum {
     NORM_RMS = 0,
     NORM_LAYER = 1,
+};
+
+enum {
+    ACT_RELU2 = 0,
+    ACT_GELU = 1,
+    ACT_RELU = 2,
 };
 
 typedef struct {
@@ -44,8 +78,8 @@ typedef struct {
     float* attn_wv;  // [L, E, E]
     float* attn_wo;  // [L, E, E]
 
-    float* mlp_fc1;  // [L, 4E, E]
-    float* mlp_fc2;  // [L, E, 4E]
+    float* mlp_fc1;  // [L, M, E]
+    float* mlp_fc2;  // [L, E, M]
 } Weights;
 
 typedef struct {
@@ -96,6 +130,7 @@ typedef struct {
     float* xn_mlp;        // [L, n, E]
     float* h1;            // [L, n, 4E]
     float* h2;            // [L, n, 4E]
+    float* dropout_mask;  // [L, n, 4E]
     float* x_out;         // [L, n, E]
 
     float* attn_probs;    // [L, n, H, n]
@@ -116,6 +151,7 @@ typedef struct {
 static const char* kChatUserTag = "<|user|>";
 static const char* kChatAssistantTag = "<|assistant|>";
 static const char* kChatEndTag = "<|end|>";
+static const char* kImStartTag = "<|im_start|>";
 
 static float rand_uniform(void) {
     return (float)rand() / (float)RAND_MAX;
@@ -208,7 +244,10 @@ static void shuffle_lines(char** lines, int n) {
 static bool dataset_looks_like_chat(char** docs, int n_docs) {
     int limit = n_docs < 8 ? n_docs : 8;
     for (int i = 0; i < limit; i++) {
-        if (strstr(docs[i], kChatUserTag) && strstr(docs[i], kChatAssistantTag)) return true;
+        if ((strstr(docs[i], kChatUserTag) && strstr(docs[i], kChatAssistantTag)) ||
+            (strstr(docs[i], kImStartTag) && strstr(docs[i], "assistant"))) {
+            return true;
+        }
     }
     return false;
 }
@@ -222,6 +261,16 @@ static bool path_has_suffix(const char* s, const char* suffix) {
 
 static const char* norm_kind_name(int norm_kind) {
     return norm_kind == NORM_LAYER ? "layernorm" : "rmsnorm";
+}
+
+static const char* act_kind_name(int act_kind) {
+    if (act_kind == ACT_GELU) return "gelu";
+    if (act_kind == ACT_RELU) return "relu";
+    return "relu2";
+}
+
+static int mlp_dim(const Config* cfg) {
+    return cfg->ffn_dim > 0 ? cfg->ffn_dim : (4 * cfg->n_embd);
 }
 
 static bool read_text_file(const char* path, char** out_text) {
@@ -291,6 +340,18 @@ static void infer_token_paths(const char* train_path, char* eval_path, size_t ev
     snprintf(meta_name, meta_sz - (size_t)(meta_name - meta_path), "meta.json");
 }
 
+static void infer_parent_dir(const char* path, char* out, size_t out_sz) {
+    const char* slash = strrchr(path, '/');
+    if (!slash) {
+        snprintf(out, out_sz, ".");
+        return;
+    }
+    size_t n = (size_t)(slash - path);
+    if (n >= out_sz) n = out_sz - 1;
+    memcpy(out, path, n);
+    out[n] = '\0';
+}
+
 static bool load_token_file_u16(const char* path, uint16_t** out_tokens, size_t* out_n) {
     FILE* f = fopen(path, "rb");
     if (!f) return false;
@@ -338,9 +399,9 @@ static bool load_token_corpus(const char* train_path, TokenCorpus* corpus) {
 
     corpus->vocab_size = json_int_field(meta_text, "vocab_size", -1);
     corpus->pad_id = json_int_field(meta_text, "pad_id", 0);
-    corpus->user_id = json_int_field(meta_text, "user_id", -1);
+    corpus->user_id = json_int_field(meta_text, "user_id", json_int_field(meta_text, "im_start_id", -1));
     corpus->assistant_id = json_int_field(meta_text, "assistant_id", -1);
-    corpus->end_id = json_int_field(meta_text, "end_id", -1);
+    corpus->end_id = json_int_field(meta_text, "end_id", json_int_field(meta_text, "im_end_id", -1));
     free(meta_text);
 
     if (corpus->vocab_size <= 0) return false;
@@ -457,10 +518,82 @@ static void build_guppy_sample(char* out, size_t out_sz) {
     static const char* const weather_prompts[] = {
         "is it warm today", "how does the water feel", "do you like cold water", "what is the tank like today"
     };
+    static const char* const clean_prompts[] = {
+        "why is the water changing", "are you okay when i clean the tank", "do you like tank cleaning", "what happens on cleaning day"
+    };
+    static const char* const clean_replies[] = {
+        "cleaning day feels strange at first, then the water tastes bright again.",
+        "i act annoyed, but i do like when the glass gets clear.",
+        "the net is rude, but fresh water is worth the drama."
+    };
+    static const char* const snail_prompts[] = {
+        "what do you think about the snail", "are the snails your friends", "do you talk to the snail", "why do you watch the snail"
+    };
+    static const char* const snail_replies[] = {
+        "the snail moves like a slow thought. i respect that.",
+        "we are not close friends, but i admire the patience.",
+        "the snail never answers, so i do most of the talking."
+    };
+    static const char* const plant_prompts[] = {
+        "which plant do you like", "why are you hiding in the plant", "do you sleep by the leaves", "what do the plants feel like"
+    };
+    static const char* const plant_replies[] = {
+        "the soft plant is best. it moves like a quiet curtain.",
+        "the leaves make a good hiding place when the room gets loud.",
+        "plants make the tank feel less like a bowl and more like a small world."
+    };
+    static const char* const dream_prompts[] = {
+        "do fish dream", "what do you dream about", "did you have a dream", "what happens when you sleep"
+    };
+    static const char* const dream_replies[] = {
+        "if fish dream, mine are mostly bubbles and impossible snacks.",
+        "i think i dream about swimming through rooms with no glass.",
+        "sometimes i wake up sure i was chasing a shining pellet."
+    };
+    static const char* const advice_prompts[] = {
+        "give me advice", "what should i do today", "say something wise", "how do i stay calm"
+    };
+    static const char* const advice_replies[] = {
+        "move a little slower. most things look less scary that way.",
+        "eat when food comes, rest when the water is calm, ignore the useless panic.",
+        "find one good corner and remember it is still there when the day feels noisy."
+    };
+    static const char* const outside_prompts[] = {
+        "what do you think about outside", "do you want to leave the tank", "is the room strange", "what is beyond the glass"
+    };
+    static const char* const outside_replies[] = {
+        "outside looks huge and dry. i prefer to study it from here.",
+        "the room is interesting, but i am built for the water part of reality.",
+        "beyond the glass is mystery. inside the glass is lunch, so i stay practical."
+    };
+    static const char* const memory_prompts[] = {
+        "what do you remember", "do you remember me", "what happened yesterday", "what sticks in your mind"
+    };
+    static const char* const memory_replies[] = {
+        "i remember feeding time very clearly and almost nothing in between.",
+        "i remember your face near the glass and the sound before food drops.",
+        "my memory is mostly little flashes: light, pellets, bubbles, sleep."
+    };
+    static const char* const compliment_prompts[] = {
+        "you look cute", "your fins are pretty", "you are a lovely fish", "you are beautiful"
+    };
+    static const char* const compliment_replies[] = {
+        "thank you. i grew these fins myself.",
+        "that is kind. i was hoping the light would catch the color today.",
+        "i accept this praise with grace and a small proud turn."
+    };
+    static const char* const fear_prompts[] = {
+        "what scares you", "are you afraid of anything", "do loud sounds scare you", "what makes you hide"
+    };
+    static const char* const fear_replies[] = {
+        "fast shadows, loud taps, and surprise nets. those are my top concerns.",
+        "i do not like sudden noise. it makes the whole tank feel jumpy.",
+        "fear feels like cold water inside warm water. i hide until it passes."
+    };
 
     const char* user = "hi guppy";
     char assistant[512];
-    int topic = rand() % 12;
+    int topic = rand() % 22;
     switch (topic) {
         case 0:
             user = pick_str(greetings, (int)(sizeof(greetings) / sizeof(greetings[0])));
@@ -512,7 +645,7 @@ static void build_guppy_sample(char* out, size_t out_sz) {
             user = pick_str(reflection_prompts, (int)(sizeof(reflection_prompts) / sizeof(reflection_prompts[0])));
             snprintf(assistant, sizeof(assistant), "the glass fish copies me. i still have questions about that.");
             break;
-        default:
+        case 11:
             if (rand() & 1) {
                 user = pick_str(music_prompts, (int)(sizeof(music_prompts) / sizeof(music_prompts[0])));
                 snprintf(assistant, sizeof(assistant), "some music feels like tiny waves. i like the slow kind.");
@@ -523,6 +656,56 @@ static void build_guppy_sample(char* out, size_t out_sz) {
                 user = pick_str(weather_prompts, (int)(sizeof(weather_prompts) / sizeof(weather_prompts[0])));
                 snprintf(assistant, sizeof(assistant), "the water feels calm and a little warm. that is a good tank day.");
             }
+            break;
+        case 12:
+            user = pick_str(clean_prompts, (int)(sizeof(clean_prompts) / sizeof(clean_prompts[0])));
+            snprintf(assistant, sizeof(assistant), "%s",
+                     pick_str(clean_replies, (int)(sizeof(clean_replies) / sizeof(clean_replies[0]))));
+            break;
+        case 13:
+            user = pick_str(snail_prompts, (int)(sizeof(snail_prompts) / sizeof(snail_prompts[0])));
+            snprintf(assistant, sizeof(assistant), "%s",
+                     pick_str(snail_replies, (int)(sizeof(snail_replies) / sizeof(snail_replies[0]))));
+            break;
+        case 14:
+            user = pick_str(plant_prompts, (int)(sizeof(plant_prompts) / sizeof(plant_prompts[0])));
+            snprintf(assistant, sizeof(assistant), "%s",
+                     pick_str(plant_replies, (int)(sizeof(plant_replies) / sizeof(plant_replies[0]))));
+            break;
+        case 15:
+            user = pick_str(dream_prompts, (int)(sizeof(dream_prompts) / sizeof(dream_prompts[0])));
+            snprintf(assistant, sizeof(assistant), "%s",
+                     pick_str(dream_replies, (int)(sizeof(dream_replies) / sizeof(dream_replies[0]))));
+            break;
+        case 16:
+            user = pick_str(advice_prompts, (int)(sizeof(advice_prompts) / sizeof(advice_prompts[0])));
+            snprintf(assistant, sizeof(assistant), "%s",
+                     pick_str(advice_replies, (int)(sizeof(advice_replies) / sizeof(advice_replies[0]))));
+            break;
+        case 17:
+            user = pick_str(outside_prompts, (int)(sizeof(outside_prompts) / sizeof(outside_prompts[0])));
+            snprintf(assistant, sizeof(assistant), "%s",
+                     pick_str(outside_replies, (int)(sizeof(outside_replies) / sizeof(outside_replies[0]))));
+            break;
+        case 18:
+            user = pick_str(memory_prompts, (int)(sizeof(memory_prompts) / sizeof(memory_prompts[0])));
+            snprintf(assistant, sizeof(assistant), "%s",
+                     pick_str(memory_replies, (int)(sizeof(memory_replies) / sizeof(memory_replies[0]))));
+            break;
+        case 19:
+            user = pick_str(compliment_prompts, (int)(sizeof(compliment_prompts) / sizeof(compliment_prompts[0])));
+            snprintf(assistant, sizeof(assistant), "%s",
+                     pick_str(compliment_replies, (int)(sizeof(compliment_replies) / sizeof(compliment_replies[0]))));
+            break;
+        case 20:
+            user = pick_str(fear_prompts, (int)(sizeof(fear_prompts) / sizeof(fear_prompts[0])));
+            snprintf(assistant, sizeof(assistant), "%s",
+                     pick_str(fear_replies, (int)(sizeof(fear_replies) / sizeof(fear_replies[0]))));
+            break;
+        default:
+            user = pick_str(weather_prompts, (int)(sizeof(weather_prompts) / sizeof(weather_prompts[0])));
+            snprintf(assistant, sizeof(assistant),
+                     "today feels gentle. i did a slow lap, watched the room, and decided this is a good water day.");
             break;
     }
 
@@ -630,17 +813,25 @@ static void linear(const float* W, const float* x, float* y, int out_dim, int in
     cblas_sgemv(CblasRowMajor, CblasNoTrans, out_dim, in_dim, 1.0f, W, in_dim, x, 1, 0.0f, y, 1);
 }
 
-// y += W^T x, W row-major [out_dim, in_dim], x[out_dim], y[in_dim]
-static void linear_t_accum(const float* W, const float* x, float* y, int out_dim, int in_dim) {
-    cblas_sgemv(CblasRowMajor, CblasTrans, out_dim, in_dim, 1.0f, W, in_dim, x, 1, 1.0f, y, 1);
+// Y[m, out_dim] = X[m, in_dim] * W[out_dim, in_dim]^T
+static void linear_seq(const float* W, const float* X, float* Y, int m, int out_dim, int in_dim) {
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                m, out_dim, in_dim,
+                1.0f, X, in_dim, W, in_dim, 0.0f, Y, out_dim);
 }
 
-static void outer_add(float* G, const float* a, const float* b, int out_dim, int in_dim) {
-    for (int o = 0; o < out_dim; o++) {
-        float ao = a[o];
-        float* go = G + (size_t)o * in_dim;
-        for (int i = 0; i < in_dim; i++) go[i] += ao * b[i];
-    }
+// Y[m, in_dim] = X[m, out_dim] * W[out_dim, in_dim]
+static void linear_t_seq(const float* W, const float* X, float* Y, int m, int out_dim, int in_dim) {
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                m, in_dim, out_dim,
+                1.0f, X, out_dim, W, in_dim, 0.0f, Y, in_dim);
+}
+
+// G[out_dim, in_dim] += dY[m, out_dim]^T * X[m, in_dim]
+static void outer_add_seq(float* G, const float* dY, const float* X, int m, int out_dim, int in_dim) {
+    cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                out_dim, in_dim, m,
+                1.0f, dY, out_dim, X, in_dim, 1.0f, G, in_dim);
 }
 
 static void rmsnorm_forward(const float* x, float* y, int n) {
@@ -718,6 +909,65 @@ static void norm_backward(const Config* cfg, const float* x, const float* dy, fl
     else rmsnorm_backward(x, dy, dx, n);
 }
 
+static float gelu_forward_scalar(float x) {
+    const float inv_sqrt2 = 0.7071067811865475f;
+    return 0.5f * x * (1.0f + erff(x * inv_sqrt2));
+}
+
+static float gelu_backward_scalar(float x) {
+    const float inv_sqrt2 = 0.7071067811865475f;
+    const float inv_sqrt_2pi = 0.3989422804014327f;
+    return 0.5f * (1.0f + erff(x * inv_sqrt2)) + x * expf(-0.5f * x * x) * inv_sqrt_2pi;
+}
+
+static void activation_forward(const Config* cfg, const float* x, float* y, int n) {
+    if (cfg->act_kind == ACT_GELU) {
+        for (int i = 0; i < n; i++) y[i] = gelu_forward_scalar(x[i]);
+    } else if (cfg->act_kind == ACT_RELU) {
+        for (int i = 0; i < n; i++) y[i] = fmaxf(0.0f, x[i]);
+    } else {
+        for (int i = 0; i < n; i++) {
+            float r = fmaxf(0.0f, x[i]);
+            y[i] = r * r;
+        }
+    }
+}
+
+static void activation_backward(const Config* cfg, const float* x, const float* dy, float* dx, int n) {
+    if (cfg->act_kind == ACT_GELU) {
+        for (int i = 0; i < n; i++) dx[i] = dy[i] * gelu_backward_scalar(x[i]);
+    } else if (cfg->act_kind == ACT_RELU) {
+        for (int i = 0; i < n; i++) dx[i] = (x[i] > 0.0f) ? dy[i] : 0.0f;
+    } else {
+        for (int i = 0; i < n; i++) dx[i] = (x[i] > 0.0f) ? (dy[i] * 2.0f * x[i]) : 0.0f;
+    }
+}
+
+static void dropout_forward(const Config* cfg, const float* x, float* y, float* mask, int n, bool training) {
+    if (!training || cfg->dropout_p <= 0.0f) {
+        for (int i = 0; i < n; i++) {
+            y[i] = x[i];
+            if (mask) mask[i] = 1.0f;
+        }
+        return;
+    }
+    float keep = 1.0f - cfg->dropout_p;
+    float scale = 1.0f / fmaxf(keep, 1e-6f);
+    for (int i = 0; i < n; i++) {
+        float m = (rand_uniform() < keep) ? scale : 0.0f;
+        if (mask) mask[i] = m;
+        y[i] = x[i] * m;
+    }
+}
+
+static void dropout_backward(const Config* cfg, const float* mask, const float* dy, float* dx, int n) {
+    if (cfg->dropout_p <= 0.0f) {
+        memcpy(dx, dy, (size_t)n * sizeof(float));
+        return;
+    }
+    for (int i = 0; i < n; i++) dx[i] = dy[i] * mask[i];
+}
+
 static const float* lm_head_weight(const Config* cfg, const Weights* w) {
     return cfg->tie_embeddings ? w->wte : w->lm_head;
 }
@@ -733,8 +983,11 @@ static bool config_matches(const Config* a, const Config* b) {
            a->block_size == b->block_size &&
            a->head_dim == b->head_dim &&
            a->vocab_size == b->vocab_size &&
+           a->ffn_dim == b->ffn_dim &&
            a->norm_kind == b->norm_kind &&
-           a->tie_embeddings == b->tie_embeddings;
+           a->tie_embeddings == b->tie_embeddings &&
+           a->act_kind == b->act_kind &&
+           fabsf(a->dropout_p - b->dropout_p) < 1e-8f;
 }
 
 static void softmax_forward(const float* logits, float* probs, int n, float temperature) {
@@ -767,8 +1020,9 @@ static size_t param_count(const Config* cfg) {
     size_t E = (size_t)cfg->n_embd;
     size_t L = (size_t)cfg->n_layer;
     size_t B = (size_t)cfg->block_size;
+    size_t M = (size_t)mlp_dim(cfg);
     size_t lm_head = cfg->tie_embeddings ? 0 : (V * E);
-    return V * E + B * E + lm_head + 4 * (L * E * E) + L * (4 * E) * E + L * E * (4 * E);
+    return V * E + B * E + lm_head + 4 * (L * E * E) + L * M * E + L * E * M;
 }
 
 static void alloc_weights(const Config* cfg, Weights* w) {
@@ -776,6 +1030,7 @@ static void alloc_weights(const Config* cfg, Weights* w) {
     size_t E = (size_t)cfg->n_embd;
     size_t L = (size_t)cfg->n_layer;
     size_t B = (size_t)cfg->block_size;
+    size_t M = (size_t)mlp_dim(cfg);
 
     w->wte = (float*)malloc(V * E * sizeof(float));
     w->wpe = (float*)malloc(B * E * sizeof(float));
@@ -786,8 +1041,8 @@ static void alloc_weights(const Config* cfg, Weights* w) {
     w->attn_wv = (float*)malloc(L * E * E * sizeof(float));
     w->attn_wo = (float*)malloc(L * E * E * sizeof(float));
 
-    w->mlp_fc1 = (float*)malloc(L * (4 * E) * E * sizeof(float));
-    w->mlp_fc2 = (float*)malloc(L * E * (4 * E) * sizeof(float));
+    w->mlp_fc1 = (float*)malloc(L * M * E * sizeof(float));
+    w->mlp_fc2 = (float*)malloc(L * E * M * sizeof(float));
 }
 
 static void free_weights(Weights* w) {
@@ -807,6 +1062,7 @@ static void init_weights(const Config* cfg, Weights* w) {
     size_t E = (size_t)cfg->n_embd;
     size_t L = (size_t)cfg->n_layer;
     size_t B = (size_t)cfg->block_size;
+    size_t M = (size_t)mlp_dim(cfg);
 
     init_mat(w->wte, V * E, 0.02f);
     init_mat(w->wpe, B * E, 0.02f);
@@ -818,8 +1074,8 @@ static void init_weights(const Config* cfg, Weights* w) {
     init_mat(w->attn_wv, L * E * E, 0.02f);
     zero_mat(w->attn_wo, L * E * E);
 
-    init_mat(w->mlp_fc1, L * (4 * E) * E, 0.02f);
-    zero_mat(w->mlp_fc2, L * E * (4 * E));
+    init_mat(w->mlp_fc1, L * M * E, 0.02f);
+    zero_mat(w->mlp_fc2, L * E * M);
 }
 
 static void alloc_grads(const Config* cfg, Grads* g) {
@@ -831,6 +1087,7 @@ static void zero_grads(const Config* cfg, Grads* g) {
     size_t E = (size_t)cfg->n_embd;
     size_t L = (size_t)cfg->n_layer;
     size_t B = (size_t)cfg->block_size;
+    size_t M = (size_t)mlp_dim(cfg);
 
     zero_mat(g->wte, V * E);
     zero_mat(g->wpe, B * E);
@@ -841,8 +1098,8 @@ static void zero_grads(const Config* cfg, Grads* g) {
     zero_mat(g->attn_wv, L * E * E);
     zero_mat(g->attn_wo, L * E * E);
 
-    zero_mat(g->mlp_fc1, L * (4 * E) * E);
-    zero_mat(g->mlp_fc2, L * E * (4 * E));
+    zero_mat(g->mlp_fc1, L * M * E);
+    zero_mat(g->mlp_fc2, L * E * M);
 }
 
 static void free_grads(Grads* g) {
@@ -864,6 +1121,7 @@ static void alloc_train_cache(const Config* cfg, TrainCache* c) {
     int L = cfg->n_layer;
     int H = cfg->n_head;
     int V = cfg->vocab_size;
+    int M = mlp_dim(cfg);
 
     c->n = 0;
     c->in_tokens = (int*)malloc((size_t)T * sizeof(int));
@@ -882,8 +1140,9 @@ static void alloc_train_cache(const Config* cfg, TrainCache* c) {
     c->attn_out = (float*)malloc((size_t)L * T * E * sizeof(float));
     c->x_after_attn = (float*)malloc((size_t)L * T * E * sizeof(float));
     c->xn_mlp = (float*)malloc((size_t)L * T * E * sizeof(float));
-    c->h1 = (float*)malloc((size_t)L * T * (4 * E) * sizeof(float));
-    c->h2 = (float*)malloc((size_t)L * T * (4 * E) * sizeof(float));
+    c->h1 = (float*)malloc((size_t)L * T * M * sizeof(float));
+    c->h2 = (float*)malloc((size_t)L * T * M * sizeof(float));
+    c->dropout_mask = (float*)malloc((size_t)L * T * M * sizeof(float));
     c->x_out = (float*)malloc((size_t)L * T * E * sizeof(float));
 
     c->attn_probs = (float*)calloc((size_t)L * T * H * T, sizeof(float));
@@ -908,6 +1167,7 @@ static void free_train_cache(TrainCache* c) {
     free(c->xn_mlp);
     free(c->h1);
     free(c->h2);
+    free(c->dropout_mask);
     free(c->x_out);
     free(c->attn_probs);
 }
@@ -920,9 +1180,10 @@ static inline float* cache_head(float* base, int layer, int pos, int head, int s
     return base + (((size_t)layer * seq_cap + pos) * n_head + head) * seq_cap;
 }
 
-static float forward_sequence(const Config* cfg, const Weights* w, TrainCache* c) {
+static float forward_sequence(const Config* cfg, const Weights* w, TrainCache* c, bool training) {
     int T = c->n;
     int E = cfg->n_embd;
+    int M = mlp_dim(cfg);
     int H = cfg->n_head;
     int D = cfg->head_dim;
     int L = cfg->n_layer;
@@ -930,6 +1191,7 @@ static float forward_sequence(const Config* cfg, const Weights* w, TrainCache* c
     int TC = cfg->block_size;
 
     float* scratch_probs = (float*)malloc((size_t)V * sizeof(float));
+    float* attn_scores = (float*)malloc((size_t)T * T * sizeof(float));
     float total_loss = 0.0f;
 
     for (int pos = 0; pos < T; pos++) {
@@ -940,87 +1202,90 @@ static float forward_sequence(const Config* cfg, const Weights* w, TrainCache* c
         const float* pe = row(w->wpe, E, pos);
         for (int i = 0; i < E; i++) es[i] = tok[i] + pe[i];
         norm_forward(cfg, es, x, E);
+    }
 
-        float* x_cur = x;
+    float* x_cur = c->x0;
+    for (int li = 0; li < L; li++) {
+        float* x_in = cache_vec(c->x_in, li, 0, TC, E);
+        float* xn_attn = cache_vec(c->xn_attn, li, 0, TC, E);
+        float* q = cache_vec(c->q, li, 0, TC, E);
+        float* k = cache_vec(c->k, li, 0, TC, E);
+        float* v = cache_vec(c->v, li, 0, TC, E);
+        float* attn_out = cache_vec(c->attn_out, li, 0, TC, E);
+        float* x_after_attn = cache_vec(c->x_after_attn, li, 0, TC, E);
+        float* xn_mlp = cache_vec(c->xn_mlp, li, 0, TC, E);
+        float* h1 = cache_vec(c->h1, li, 0, TC, M);
+        float* h2 = cache_vec(c->h2, li, 0, TC, M);
+        float* drop_mask = cache_vec(c->dropout_mask, li, 0, TC, M);
+        float* x_out = cache_vec(c->x_out, li, 0, TC, E);
 
-        for (int li = 0; li < L; li++) {
-            float* x_in = cache_vec(c->x_in, li, pos, TC, E);
-            float* xn_attn = cache_vec(c->xn_attn, li, pos, TC, E);
-            float* q = cache_vec(c->q, li, pos, TC, E);
-            float* k = cache_vec(c->k, li, pos, TC, E);
-            float* v = cache_vec(c->v, li, pos, TC, E);
-            float* attn_out = cache_vec(c->attn_out, li, pos, TC, E);
-            float* x_after_attn = cache_vec(c->x_after_attn, li, pos, TC, E);
-            float* xn_mlp = cache_vec(c->xn_mlp, li, pos, TC, E);
-            float* h1 = cache_vec(c->h1, li, pos, TC, 4 * E);
-            float* h2 = cache_vec(c->h2, li, pos, TC, 4 * E);
-            float* x_out = cache_vec(c->x_out, li, pos, TC, E);
+        memcpy(x_in, x_cur, (size_t)T * E * sizeof(float));
+        for (int pos = 0; pos < T; pos++) norm_forward(cfg, row(x_in, E, pos), row(xn_attn, E, pos), E);
 
-            memcpy(x_in, x_cur, (size_t)E * sizeof(float));
-            norm_forward(cfg, x_in, xn_attn, E);
+        const float* Wq = w->attn_wq + (size_t)li * E * E;
+        const float* Wk = w->attn_wk + (size_t)li * E * E;
+        const float* Wv = w->attn_wv + (size_t)li * E * E;
+        const float* Wo = w->attn_wo + (size_t)li * E * E;
+        const float* W1 = w->mlp_fc1 + (size_t)li * M * E;
+        const float* W2 = w->mlp_fc2 + (size_t)li * E * M;
 
-            const float* Wq = w->attn_wq + (size_t)li * E * E;
-            const float* Wk = w->attn_wk + (size_t)li * E * E;
-            const float* Wv = w->attn_wv + (size_t)li * E * E;
-            const float* Wo = w->attn_wo + (size_t)li * E * E;
+        linear_seq(Wq, xn_attn, q, T, E, E);
+        linear_seq(Wk, xn_attn, k, T, E, E);
+        linear_seq(Wv, xn_attn, v, T, E, E);
 
-            linear(Wq, xn_attn, q, E, E);
-            linear(Wk, xn_attn, k, E, E);
-            linear(Wv, xn_attn, v, E, E);
-
-            for (int i = 0; i < E; i++) attn_out[i] = 0.0f;
-
-            for (int h = 0; h < H; h++) {
-                int hs = h * D;
-                float* probs = cache_head(c->attn_probs, li, pos, h, TC, H);
-
-                for (int t = 0; t <= pos; t++) {
-                    const float* kt = cache_vec(c->k, li, t, TC, E) + hs;
-                    probs[t] = cblas_sdot(D, q + hs, 1, kt, 1) / sqrtf((float)D);
-                }
-                softmax_forward(probs, probs, pos + 1, 1.0f);
-
-                float* out_h = attn_out + hs;
-                for (int j = 0; j < D; j++) out_h[j] = 0.0f;
-                for (int t = 0; t <= pos; t++) {
-                    const float* vt = cache_vec(c->v, li, t, TC, E) + hs;
-                    cblas_saxpy(D, probs[t], vt, 1, out_h, 1);
-                }
+        memset(attn_out, 0, (size_t)T * E * sizeof(float));
+        for (int h = 0; h < H; h++) {
+            int hs = h * D;
+            float scale = 1.0f / sqrtf((float)D);
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        T, T, D,
+                        scale, q + hs, E, k + hs, E,
+                        0.0f, attn_scores, T);
+            for (int pos = 0; pos < T; pos++) {
+                float* row_scores = attn_scores + (size_t)pos * T;
+                softmax_forward(row_scores, row_scores, pos + 1, 1.0f);
+                for (int t = pos + 1; t < T; t++) row_scores[t] = 0.0f;
+                memcpy(cache_head(c->attn_probs, li, pos, h, TC, H), row_scores, (size_t)T * sizeof(float));
             }
-
-            linear(Wo, attn_out, x_after_attn, E, E);
-            for (int i = 0; i < E; i++) x_after_attn[i] += x_in[i];
-
-            norm_forward(cfg, x_after_attn, xn_mlp, E);
-            const float* W1 = w->mlp_fc1 + (size_t)li * (4 * E) * E;
-            const float* W2 = w->mlp_fc2 + (size_t)li * E * (4 * E);
-
-            linear(W1, xn_mlp, h1, 4 * E, E);
-            for (int i = 0; i < 4 * E; i++) {
-                float r = fmaxf(0.0f, h1[i]);
-                h2[i] = r * r;
-            }
-            linear(W2, h2, x_out, E, 4 * E);
-            for (int i = 0; i < E; i++) x_out[i] += x_after_attn[i];
-
-            x_cur = x_out;
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        T, D, T,
+                        1.0f, attn_scores, T, v + hs, E,
+                        1.0f, attn_out + hs, E);
         }
 
-        memcpy(row(c->x_final, E, pos), x_cur, (size_t)E * sizeof(float));
-        linear(lm_head_weight(cfg, w), x_cur, row(c->logits, V, pos), V, E);
+        linear_seq(Wo, attn_out, x_after_attn, T, E, E);
+        for (int i = 0; i < T * E; i++) x_after_attn[i] += x_in[i];
 
+        for (int pos = 0; pos < T; pos++) norm_forward(cfg, row(x_after_attn, E, pos), row(xn_mlp, E, pos), E);
+        linear_seq(W1, xn_mlp, h1, T, M, E);
+        for (int pos = 0; pos < T; pos++) {
+            activation_forward(cfg, row(h1, M, pos), row(h2, M, pos), M);
+            dropout_forward(cfg, row(h2, M, pos), row(h2, M, pos), row(drop_mask, M, pos), M, training);
+        }
+        linear_seq(W2, h2, x_out, T, E, M);
+        for (int i = 0; i < T * E; i++) x_out[i] += x_after_attn[i];
+
+        x_cur = x_out;
+    }
+
+    memcpy(c->x_final, x_cur, (size_t)T * E * sizeof(float));
+    linear_seq(lm_head_weight(cfg, w), c->x_final, c->logits, T, V, E);
+
+    for (int pos = 0; pos < T; pos++) {
         softmax_forward(row(c->logits, V, pos), scratch_probs, V, 1.0f);
         int tgt = c->targets[pos];
         total_loss += -logf(fmaxf(scratch_probs[tgt], 1e-12f));
     }
 
     free(scratch_probs);
+    free(attn_scores);
     return total_loss / (float)T;
 }
 
 static void backward_sequence(const Config* cfg, const Weights* w, const TrainCache* c, Grads* g) {
     int T = c->n;
     int E = cfg->n_embd;
+    int M = mlp_dim(cfg);
     int H = cfg->n_head;
     int D = cfg->head_dim;
     int L = cfg->n_layer;
@@ -1029,133 +1294,127 @@ static void backward_sequence(const Config* cfg, const Weights* w, const TrainCa
 
     float invT = 1.0f / (float)T;
 
-    float* d_logits = (float*)malloc((size_t)V * sizeof(float));
-    float* d_top = (float*)calloc((size_t)T * E, sizeof(float));
-
-    for (int pos = 0; pos < T; pos++) {
-        softmax_forward(row((float*)c->logits, V, pos), d_logits, V, 1.0f);
-        d_logits[c->targets[pos]] -= 1.0f;
-        for (int i = 0; i < V; i++) d_logits[i] *= invT;
-
-        outer_add(lm_head_grad(cfg, g), d_logits, row((float*)c->x_final, E, pos), V, E);
-        linear_t_accum(lm_head_weight(cfg, w), d_logits, row(d_top, E, pos), V, E);
-    }
-
-    float* dK = (float*)calloc((size_t)L * T * E, sizeof(float));
-    float* dV = (float*)calloc((size_t)L * T * E, sizeof(float));
-
-    float* d = (float*)malloc((size_t)E * sizeof(float));
-    float* tmpE = (float*)malloc((size_t)E * sizeof(float));
-    float* d_xin = (float*)malloc((size_t)E * sizeof(float));
-    float* d_attn_out = (float*)malloc((size_t)E * sizeof(float));
-    float* d_xn = (float*)malloc((size_t)E * sizeof(float));
-
-    float* d_h2 = (float*)malloc((size_t)(4 * E) * sizeof(float));
-    float* d_h1 = (float*)malloc((size_t)(4 * E) * sizeof(float));
-    float* d_mlp = (float*)malloc((size_t)E * sizeof(float));
-
+    float* d_logits = (float*)malloc((size_t)T * V * sizeof(float));
+    float* d_cur = (float*)calloc((size_t)T * E, sizeof(float));
+    float* d_next = (float*)calloc((size_t)T * E, sizeof(float));
+    float* d_proj = (float*)malloc((size_t)T * E * sizeof(float));
+    float* d_q = (float*)calloc((size_t)T * E, sizeof(float));
+    float* dK = (float*)calloc((size_t)T * E, sizeof(float));
+    float* dV = (float*)calloc((size_t)T * E, sizeof(float));
+    float* d_xn = (float*)malloc((size_t)T * E * sizeof(float));
+    float* d_h2 = (float*)malloc((size_t)T * M * sizeof(float));
+    float* d_h1 = (float*)malloc((size_t)T * M * sizeof(float));
+    float* d_embed = (float*)calloc((size_t)E, sizeof(float));
+    float* attn_probs_mat = (float*)malloc((size_t)T * T * sizeof(float));
+    float* d_attn_scores = (float*)malloc((size_t)T * T * sizeof(float));
     float* d_a = (float*)malloc((size_t)cfg->block_size * sizeof(float));
     float* d_z = (float*)malloc((size_t)cfg->block_size * sizeof(float));
 
-    float* d_embed = (float*)calloc((size_t)E, sizeof(float));
-    for (int pos = T - 1; pos >= 0; pos--) {
-        memcpy(d, row(d_top, E, pos), (size_t)E * sizeof(float));
+    for (int pos = 0; pos < T; pos++) {
+        float* dlog = row(d_logits, V, pos);
+        softmax_forward(row((float*)c->logits, V, pos), dlog, V, 1.0f);
+        dlog[c->targets[pos]] -= 1.0f;
+        for (int i = 0; i < V; i++) dlog[i] *= invT;
+    }
+    outer_add_seq(lm_head_grad(cfg, g), d_logits, (float*)c->x_final, T, V, E);
+    linear_t_seq(lm_head_weight(cfg, w), d_logits, d_cur, T, V, E);
 
-        for (int li = L - 1; li >= 0; li--) {
-            float* x_in = cache_vec((float*)c->x_in, li, pos, TC, E);
-            float* xn_attn = cache_vec((float*)c->xn_attn, li, pos, TC, E);
-            float* q = cache_vec((float*)c->q, li, pos, TC, E);
-            float* attn_out = cache_vec((float*)c->attn_out, li, pos, TC, E);
-            float* x_after_attn = cache_vec((float*)c->x_after_attn, li, pos, TC, E);
-            float* xn_mlp = cache_vec((float*)c->xn_mlp, li, pos, TC, E);
-            float* h1 = cache_vec((float*)c->h1, li, pos, TC, 4 * E);
-            float* h2 = cache_vec((float*)c->h2, li, pos, TC, 4 * E);
+    for (int li = L - 1; li >= 0; li--) {
+        float* x_in = cache_vec((float*)c->x_in, li, 0, TC, E);
+        float* xn_attn = cache_vec((float*)c->xn_attn, li, 0, TC, E);
+        float* q = cache_vec((float*)c->q, li, 0, TC, E);
+        float* k = cache_vec((float*)c->k, li, 0, TC, E);
+        float* v = cache_vec((float*)c->v, li, 0, TC, E);
+        float* attn_out = cache_vec((float*)c->attn_out, li, 0, TC, E);
+        float* x_after_attn = cache_vec((float*)c->x_after_attn, li, 0, TC, E);
+        float* xn_mlp = cache_vec((float*)c->xn_mlp, li, 0, TC, E);
+        float* h1 = cache_vec((float*)c->h1, li, 0, TC, M);
+        float* h2 = cache_vec((float*)c->h2, li, 0, TC, M);
+        float* drop_mask = cache_vec((float*)c->dropout_mask, li, 0, TC, M);
 
-            const float* Wq = w->attn_wq + (size_t)li * E * E;
-            const float* Wk = w->attn_wk + (size_t)li * E * E;
-            const float* Wv = w->attn_wv + (size_t)li * E * E;
-            const float* Wo = w->attn_wo + (size_t)li * E * E;
-            const float* W1 = w->mlp_fc1 + (size_t)li * (4 * E) * E;
-            const float* W2 = w->mlp_fc2 + (size_t)li * E * (4 * E);
+        const float* Wq = w->attn_wq + (size_t)li * E * E;
+        const float* Wk = w->attn_wk + (size_t)li * E * E;
+        const float* Wv = w->attn_wv + (size_t)li * E * E;
+        const float* Wo = w->attn_wo + (size_t)li * E * E;
+        const float* W1 = w->mlp_fc1 + (size_t)li * M * E;
+        const float* W2 = w->mlp_fc2 + (size_t)li * E * M;
 
-            // MLP block backward
-            memcpy(d_mlp, d, (size_t)E * sizeof(float));
-            memcpy(d_xin, d, (size_t)E * sizeof(float));  // residual path to x_after_attn
-
-            outer_add(g->mlp_fc2 + (size_t)li * E * (4 * E), d_mlp, h2, E, 4 * E);
-            for (int i = 0; i < 4 * E; i++) d_h2[i] = 0.0f;
-            linear_t_accum(W2, d_mlp, d_h2, E, 4 * E);
-
-            for (int i = 0; i < 4 * E; i++) {
-                d_h1[i] = (h1[i] > 0.0f) ? (d_h2[i] * 2.0f * h1[i]) : 0.0f;
-            }
-
-            outer_add(g->mlp_fc1 + (size_t)li * (4 * E) * E, d_h1, xn_mlp, 4 * E, E);
-            for (int i = 0; i < E; i++) d_xn[i] = 0.0f;
-            linear_t_accum(W1, d_h1, d_xn, 4 * E, E);
-
-            norm_backward(cfg, x_after_attn, d_xn, d_xin, E);
-
-            // Attention block backward
-            memcpy(d_attn_out, d_xin, (size_t)E * sizeof(float));  // through Wo path
-            memcpy(tmpE, d_xin, (size_t)E * sizeof(float));         // residual x_in path
-
-            outer_add(g->attn_wo + (size_t)li * E * E, d_attn_out, attn_out, E, E);
-            for (int i = 0; i < E; i++) d_attn_out[i] = 0.0f;
-            linear_t_accum(Wo, d_xin, d_attn_out, E, E);
-
-            for (int i = 0; i < E; i++) d_xn[i] = 0.0f;
-
-            for (int h = 0; h < H; h++) {
-                int hs = h * D;
-                const float* qh = q + hs;
-                const float* probs = cache_head((float*)c->attn_probs, li, pos, h, TC, H);
-                const float* d_head = d_attn_out + hs;
-
-                for (int t = 0; t <= pos; t++) {
-                    const float* vt = cache_vec((float*)c->v, li, t, TC, E) + hs;
-                    d_a[t] = cblas_sdot(D, d_head, 1, vt, 1);
-                }
-
-                float dot_da_p = 0.0f;
-                for (int t = 0; t <= pos; t++) dot_da_p += d_a[t] * probs[t];
-                for (int t = 0; t <= pos; t++) d_z[t] = probs[t] * (d_a[t] - dot_da_p);
-
-                float* dq_h = d_xn + hs;
-                for (int j = 0; j < D; j++) dq_h[j] = 0.0f;
-
-                for (int t = 0; t <= pos; t++) {
-                    const float* kt = cache_vec((float*)c->k, li, t, TC, E) + hs;
-                    float* dkt = cache_vec(dK, li, t, T, E) + hs;
-                    float* dvt = cache_vec(dV, li, t, T, E) + hs;
-
-                    float inv_sqrt_d = 1.0f / sqrtf((float)D);
-                    for (int j = 0; j < D; j++) {
-                        dq_h[j] += d_z[t] * kt[j] * inv_sqrt_d;
-                        dkt[j] += d_z[t] * qh[j] * inv_sqrt_d;
-                        dvt[j] += probs[t] * d_head[j];
-                    }
-                }
-            }
-
-            float* dk_cur = cache_vec(dK, li, pos, T, E);
-            float* dv_cur = cache_vec(dV, li, pos, T, E);
-
-            outer_add(g->attn_wq + (size_t)li * E * E, d_xn, xn_attn, E, E);
-            linear_t_accum(Wq, d_xn, tmpE, E, E);
-
-            outer_add(g->attn_wk + (size_t)li * E * E, dk_cur, xn_attn, E, E);
-            linear_t_accum(Wk, dk_cur, tmpE, E, E);
-
-            outer_add(g->attn_wv + (size_t)li * E * E, dv_cur, xn_attn, E, E);
-            linear_t_accum(Wv, dv_cur, tmpE, E, E);
-
-            for (int i = 0; i < E; i++) d[i] = 0.0f;
-            norm_backward(cfg, x_in, tmpE, d, E);
+        memcpy(d_next, d_cur, (size_t)T * E * sizeof(float));  // residual path from x_out to x_after_attn
+        outer_add_seq(g->mlp_fc2 + (size_t)li * E * M, d_cur, h2, T, E, M);
+        linear_t_seq(W2, d_cur, d_h2, T, E, M);
+        for (int pos = 0; pos < T; pos++) {
+            dropout_backward(cfg, row(drop_mask, M, pos), row(d_h2, M, pos), row(d_h2, M, pos), M);
+            activation_backward(cfg, row(h1, M, pos), row(d_h2, M, pos), row(d_h1, M, pos), M);
+        }
+        outer_add_seq(g->mlp_fc1 + (size_t)li * M * E, d_h1, xn_mlp, T, M, E);
+        linear_t_seq(W1, d_h1, d_xn, T, M, E);
+        for (int pos = 0; pos < T; pos++) {
+            norm_backward(cfg, row(x_after_attn, E, pos), row(d_xn, E, pos), row(d_next, E, pos), E);
         }
 
+        outer_add_seq(g->attn_wo + (size_t)li * E * E, d_next, attn_out, T, E, E);
+        linear_t_seq(Wo, d_next, d_proj, T, E, E);
+
+        memset(d_q, 0, (size_t)T * E * sizeof(float));
+        memset(dK, 0, (size_t)T * E * sizeof(float));
+        memset(dV, 0, (size_t)T * E * sizeof(float));
+        for (int h = 0; h < H; h++) {
+            int hs = h * D;
+            float inv_sqrt_d = 1.0f / sqrtf((float)D);
+            for (int pos = 0; pos < T; pos++) {
+                memcpy(attn_probs_mat + (size_t)pos * T,
+                       cache_head((float*)c->attn_probs, li, pos, h, TC, H),
+                       (size_t)T * sizeof(float));
+            }
+
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        T, T, D,
+                        1.0f, d_proj + hs, E, v + hs, E,
+                        0.0f, d_attn_scores, T);
+            for (int pos = 0; pos < T; pos++) {
+                const float* probs = attn_probs_mat + (size_t)pos * T;
+                float* dA = d_attn_scores + (size_t)pos * T;
+                float dot_da_p = 0.0f;
+                for (int t = 0; t <= pos; t++) dot_da_p += dA[t] * probs[t];
+                for (int t = 0; t <= pos; t++) dA[t] = probs[t] * (dA[t] - dot_da_p);
+                for (int t = pos + 1; t < T; t++) dA[t] = 0.0f;
+            }
+
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        T, D, T,
+                        inv_sqrt_d, d_attn_scores, T, k + hs, E,
+                        1.0f, d_q + hs, E);
+            cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                        T, D, T,
+                        inv_sqrt_d, d_attn_scores, T, q + hs, E,
+                        1.0f, dK + hs, E);
+            cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                        T, D, T,
+                        1.0f, attn_probs_mat, T, d_proj + hs, E,
+                        1.0f, dV + hs, E);
+        }
+
+        outer_add_seq(g->attn_wq + (size_t)li * E * E, d_q, xn_attn, T, E, E);
+        linear_t_seq(Wq, d_q, d_xn, T, E, E);
+        for (int i = 0; i < T * E; i++) d_next[i] += d_xn[i];
+
+        outer_add_seq(g->attn_wk + (size_t)li * E * E, dK, xn_attn, T, E, E);
+        linear_t_seq(Wk, dK, d_xn, T, E, E);
+        for (int i = 0; i < T * E; i++) d_next[i] += d_xn[i];
+
+        outer_add_seq(g->attn_wv + (size_t)li * E * E, dV, xn_attn, T, E, E);
+        linear_t_seq(Wv, dV, d_xn, T, E, E);
+        for (int i = 0; i < T * E; i++) d_next[i] += d_xn[i];
+
+        memset(d_cur, 0, (size_t)T * E * sizeof(float));
+        for (int pos = 0; pos < T; pos++) {
+            norm_backward(cfg, row(x_in, E, pos), row(d_next, E, pos), row(d_cur, E, pos), E);
+        }
+    }
+
+    for (int pos = 0; pos < T; pos++) {
         for (int i = 0; i < E; i++) d_embed[i] = 0.0f;
-        norm_backward(cfg, row((float*)c->embed_sum, E, pos), d, d_embed, E);
+        norm_backward(cfg, row((float*)c->embed_sum, E, pos), row(d_cur, E, pos), d_embed, E);
 
         float* gwte = row(g->wte, E, c->in_tokens[pos]);
         float* gwpe = row(g->wpe, E, pos);
@@ -1167,21 +1426,19 @@ static void backward_sequence(const Config* cfg, const Weights* w, const TrainCa
     free(d_embed);
 
     free(d_logits);
-    free(d_top);
-
+    free(d_cur);
+    free(d_next);
+    free(d_proj);
+    free(d_q);
     free(dK);
     free(dV);
-
-    free(d);
-    free(tmpE);
-    free(d_xin);
-    free(d_attn_out);
     free(d_xn);
     free(d_h2);
     free(d_h1);
-    free(d_mlp);
     free(d_a);
     free(d_z);
+    free(attn_probs_mat);
+    free(d_attn_scores);
 }
 
 static void adam_update_array(float* p, const float* g, float* m, float* v, size_t n,
@@ -1197,12 +1454,35 @@ static void adam_update_array(float* p, const float* g, float* m, float* v, size
     }
 }
 
+static void scale_grad_array(float* g, size_t n, float scale) {
+    for (size_t i = 0; i < n; i++) g[i] *= scale;
+}
+
+static void scale_grads(const Config* cfg, Grads* g, float scale) {
+    size_t V = (size_t)cfg->vocab_size;
+    size_t E = (size_t)cfg->n_embd;
+    size_t L = (size_t)cfg->n_layer;
+    size_t B = (size_t)cfg->block_size;
+    size_t M = (size_t)mlp_dim(cfg);
+
+    scale_grad_array(g->wte, V * E, scale);
+    scale_grad_array(g->wpe, B * E, scale);
+    scale_grad_array(g->lm_head, V * E, scale);
+    scale_grad_array(g->attn_wq, L * E * E, scale);
+    scale_grad_array(g->attn_wk, L * E * E, scale);
+    scale_grad_array(g->attn_wv, L * E * E, scale);
+    scale_grad_array(g->attn_wo, L * E * E, scale);
+    scale_grad_array(g->mlp_fc1, L * M * E, scale);
+    scale_grad_array(g->mlp_fc2, L * E * M, scale);
+}
+
 static void adam_update(const Config* cfg, Weights* w, const Grads* g, AdamBuf* m1, AdamBuf* m2,
                         float lr_t, float beta1, float beta2, float eps, int step1) {
     size_t V = (size_t)cfg->vocab_size;
     size_t E = (size_t)cfg->n_embd;
     size_t L = (size_t)cfg->n_layer;
     size_t B = (size_t)cfg->block_size;
+    size_t M = (size_t)mlp_dim(cfg);
 
     adam_update_array(w->wte, g->wte, m1->wte, m2->wte, V * E, lr_t, beta1, beta2, eps, step1);
     adam_update_array(w->wpe, g->wpe, m1->wpe, m2->wpe, B * E, lr_t, beta1, beta2, eps, step1);
@@ -1215,8 +1495,8 @@ static void adam_update(const Config* cfg, Weights* w, const Grads* g, AdamBuf* 
     adam_update_array(w->attn_wv, g->attn_wv, m1->attn_wv, m2->attn_wv, L * E * E, lr_t, beta1, beta2, eps, step1);
     adam_update_array(w->attn_wo, g->attn_wo, m1->attn_wo, m2->attn_wo, L * E * E, lr_t, beta1, beta2, eps, step1);
 
-    adam_update_array(w->mlp_fc1, g->mlp_fc1, m1->mlp_fc1, m2->mlp_fc1, L * (4 * E) * E, lr_t, beta1, beta2, eps, step1);
-    adam_update_array(w->mlp_fc2, g->mlp_fc2, m1->mlp_fc2, m2->mlp_fc2, L * E * (4 * E), lr_t, beta1, beta2, eps, step1);
+    adam_update_array(w->mlp_fc1, g->mlp_fc1, m1->mlp_fc1, m2->mlp_fc1, L * M * E, lr_t, beta1, beta2, eps, step1);
+    adam_update_array(w->mlp_fc2, g->mlp_fc2, m1->mlp_fc2, m2->mlp_fc2, L * E * M, lr_t, beta1, beta2, eps, step1);
 }
 
 static void gpt_infer_step(const Config* cfg, const Weights* w,
@@ -1227,6 +1507,7 @@ static void gpt_infer_step(const Config* cfg, const Weights* w,
     int D = cfg->head_dim;
     int L = cfg->n_layer;
     int B = cfg->block_size;
+    int M = mlp_dim(cfg);
 
     float* x = (float*)malloc((size_t)E * sizeof(float));
     float* tmp = (float*)malloc((size_t)E * sizeof(float));
@@ -1235,7 +1516,7 @@ static void gpt_infer_step(const Config* cfg, const Weights* w,
     float* k = (float*)malloc((size_t)E * sizeof(float));
     float* v = (float*)malloc((size_t)E * sizeof(float));
     float* attn_out = (float*)malloc((size_t)E * sizeof(float));
-    float* mlp = (float*)malloc((size_t)(4 * E) * sizeof(float));
+    float* mlp = (float*)malloc((size_t)M * sizeof(float));
 
     const float* tok = row(w->wte, E, token_id);
     const float* pe = row(w->wpe, E, pos_id);
@@ -1283,14 +1564,11 @@ static void gpt_infer_step(const Config* cfg, const Weights* w,
         memcpy(tmp, x, (size_t)E * sizeof(float));
         norm_forward(cfg, x, xn, E);
 
-        const float* W1 = w->mlp_fc1 + (size_t)li * (4 * E) * E;
-        const float* W2 = w->mlp_fc2 + (size_t)li * E * (4 * E);
-        linear(W1, xn, mlp, 4 * E, E);
-        for (int i = 0; i < 4 * E; i++) {
-            float r = fmaxf(0.0f, mlp[i]);
-            mlp[i] = r * r;
-        }
-        linear(W2, mlp, x, E, 4 * E);
+        const float* W1 = w->mlp_fc1 + (size_t)li * M * E;
+        const float* W2 = w->mlp_fc2 + (size_t)li * E * M;
+        linear(W1, xn, mlp, M, E);
+        activation_forward(cfg, mlp, mlp, M);
+        linear(W2, mlp, x, E, M);
         for (int i = 0; i < E; i++) x[i] += tmp[i];
     }
 
@@ -1314,7 +1592,7 @@ static float eval_split_loss(const Config* cfg, const Weights* w, TrainCache* ca
     for (int i = 0; i < eval_iters; i++) {
         int idx = start + (rand() % count);
         prepare_example(docs[idx], BOS, char_to_id, cfg->block_size, toks, cache);
-        s += forward_sequence(cfg, w, cache);
+        s += forward_sequence(cfg, w, cache, false);
     }
     return s / (float)eval_iters;
 }
@@ -1325,21 +1603,36 @@ static float eval_token_loss(const Config* cfg, const Weights* w, TrainCache* ca
     float s = 0.0f;
     for (int i = 0; i < eval_iters; i++) {
         prepare_token_example(tokens, n_tokens, cfg->block_size, cache);
-        s += forward_sequence(cfg, w, cache);
+        s += forward_sequence(cfg, w, cache, false);
     }
     return s / (float)eval_iters;
+}
+
+static int env_int_or(const char* key, int fallback) {
+    const char* v = getenv(key);
+    return (v && v[0] != '\0') ? atoi(v) : fallback;
+}
+
+static float env_float_or(const char* key, float fallback) {
+    const char* v = getenv(key);
+    return (v && v[0] != '\0') ? atof(v) : fallback;
+}
+
+static bool env_equals(const char* key, const char* expected) {
+    const char* v = getenv(key);
+    return v && strcmp(v, expected) == 0;
 }
 
 static bool save_checkpoint(const char* path, const Config* cfg, const Weights* w) {
     FILE* f = fopen(path, "wb");
     if (!f) return false;
     const uint32_t magic = 0x4D475043;  // MGPC
-    const uint32_t version = 2;
+    const uint32_t version = 4;
     if (fwrite(&magic, sizeof(magic), 1, f) != 1) goto fail;
     if (fwrite(&version, sizeof(version), 1, f) != 1) goto fail;
     if (fwrite(cfg, sizeof(*cfg), 1, f) != 1) goto fail;
 
-    size_t V = (size_t)cfg->vocab_size, E = (size_t)cfg->n_embd, L = (size_t)cfg->n_layer, B = (size_t)cfg->block_size;
+    size_t V = (size_t)cfg->vocab_size, E = (size_t)cfg->n_embd, L = (size_t)cfg->n_layer, B = (size_t)cfg->block_size, M = (size_t)mlp_dim(cfg);
     if (fwrite(w->wte, sizeof(float), V * E, f) != V * E) goto fail;
     if (fwrite(w->wpe, sizeof(float), B * E, f) != B * E) goto fail;
     const float* lm_head = cfg->tie_embeddings ? w->wte : w->lm_head;
@@ -1348,8 +1641,8 @@ static bool save_checkpoint(const char* path, const Config* cfg, const Weights* 
     if (fwrite(w->attn_wk, sizeof(float), L * E * E, f) != L * E * E) goto fail;
     if (fwrite(w->attn_wv, sizeof(float), L * E * E, f) != L * E * E) goto fail;
     if (fwrite(w->attn_wo, sizeof(float), L * E * E, f) != L * E * E) goto fail;
-    if (fwrite(w->mlp_fc1, sizeof(float), L * (4 * E) * E, f) != L * (4 * E) * E) goto fail;
-    if (fwrite(w->mlp_fc2, sizeof(float), L * E * (4 * E), f) != L * E * (4 * E)) goto fail;
+    if (fwrite(w->mlp_fc1, sizeof(float), L * M * E, f) != L * M * E) goto fail;
+    if (fwrite(w->mlp_fc2, sizeof(float), L * E * M, f) != L * E * M) goto fail;
     fclose(f);
     return true;
 fail:
@@ -1375,11 +1668,48 @@ static bool load_checkpoint_config(const char* path, Config* out_cfg) {
             .block_size = old.block_size,
             .head_dim = old.head_dim,
             .vocab_size = old.vocab_size,
+            .ffn_dim = 4 * old.n_embd,
             .norm_kind = NORM_RMS,
             .tie_embeddings = 0,
+            .act_kind = ACT_RELU2,
+            .dropout_p = 0.0f,
         };
         ok = true;
     } else if (version == 2) {
+        ConfigV2 old = {0};
+        if (fread(&old, sizeof(old), 1, f) != 1) goto done;
+        *out_cfg = (Config){
+            .n_embd = old.n_embd,
+            .n_head = old.n_head,
+            .n_layer = old.n_layer,
+            .block_size = old.block_size,
+            .head_dim = old.head_dim,
+            .vocab_size = old.vocab_size,
+            .ffn_dim = 4 * old.n_embd,
+            .norm_kind = old.norm_kind,
+            .tie_embeddings = old.tie_embeddings,
+            .act_kind = ACT_RELU2,
+            .dropout_p = 0.0f,
+        };
+        ok = true;
+    } else if (version == 3) {
+        ConfigV3 old = {0};
+        if (fread(&old, sizeof(old), 1, f) != 1) goto done;
+        *out_cfg = (Config){
+            .n_embd = old.n_embd,
+            .n_head = old.n_head,
+            .n_layer = old.n_layer,
+            .block_size = old.block_size,
+            .head_dim = old.head_dim,
+            .vocab_size = old.vocab_size,
+            .ffn_dim = 4 * old.n_embd,
+            .norm_kind = old.norm_kind,
+            .tie_embeddings = old.tie_embeddings,
+            .act_kind = old.act_kind,
+            .dropout_p = old.dropout_p,
+        };
+        ok = true;
+    } else if (version == 4) {
         if (fread(out_cfg, sizeof(*out_cfg), 1, f) != 1) goto done;
         ok = true;
     }
@@ -1406,17 +1736,52 @@ static bool load_checkpoint(const char* path, const Config* cfg, Weights* w) {
             .block_size = old.block_size,
             .head_dim = old.head_dim,
             .vocab_size = old.vocab_size,
+            .ffn_dim = 4 * old.n_embd,
             .norm_kind = NORM_RMS,
             .tie_embeddings = 0,
+            .act_kind = ACT_RELU2,
+            .dropout_p = 0.0f,
         };
     } else if (version == 2) {
+        ConfigV2 old = {0};
+        if (fread(&old, sizeof(old), 1, f) != 1) goto fail;
+        ck = (Config){
+            .n_embd = old.n_embd,
+            .n_head = old.n_head,
+            .n_layer = old.n_layer,
+            .block_size = old.block_size,
+            .head_dim = old.head_dim,
+            .vocab_size = old.vocab_size,
+            .ffn_dim = 4 * old.n_embd,
+            .norm_kind = old.norm_kind,
+            .tie_embeddings = old.tie_embeddings,
+            .act_kind = ACT_RELU2,
+            .dropout_p = 0.0f,
+        };
+    } else if (version == 3) {
+        ConfigV3 old = {0};
+        if (fread(&old, sizeof(old), 1, f) != 1) goto fail;
+        ck = (Config){
+            .n_embd = old.n_embd,
+            .n_head = old.n_head,
+            .n_layer = old.n_layer,
+            .block_size = old.block_size,
+            .head_dim = old.head_dim,
+            .vocab_size = old.vocab_size,
+            .ffn_dim = 4 * old.n_embd,
+            .norm_kind = old.norm_kind,
+            .tie_embeddings = old.tie_embeddings,
+            .act_kind = old.act_kind,
+            .dropout_p = old.dropout_p,
+        };
+    } else if (version == 4) {
         if (fread(&ck, sizeof(ck), 1, f) != 1) goto fail;
     } else {
         goto fail;
     }
     if (!config_matches(&ck, cfg)) goto fail;
 
-    size_t V = (size_t)cfg->vocab_size, E = (size_t)cfg->n_embd, L = (size_t)cfg->n_layer, B = (size_t)cfg->block_size;
+    size_t V = (size_t)cfg->vocab_size, E = (size_t)cfg->n_embd, L = (size_t)cfg->n_layer, B = (size_t)cfg->block_size, M = (size_t)mlp_dim(cfg);
     if (fread(w->wte, sizeof(float), V * E, f) != V * E) goto fail;
     if (fread(w->wpe, sizeof(float), B * E, f) != B * E) goto fail;
     if (fread(w->lm_head, sizeof(float), V * E, f) != V * E) goto fail;
@@ -1424,8 +1789,8 @@ static bool load_checkpoint(const char* path, const Config* cfg, Weights* w) {
     if (fread(w->attn_wk, sizeof(float), L * E * E, f) != L * E * E) goto fail;
     if (fread(w->attn_wv, sizeof(float), L * E * E, f) != L * E * E) goto fail;
     if (fread(w->attn_wo, sizeof(float), L * E * E, f) != L * E * E) goto fail;
-    if (fread(w->mlp_fc1, sizeof(float), L * (4 * E) * E, f) != L * (4 * E) * E) goto fail;
-    if (fread(w->mlp_fc2, sizeof(float), L * E * (4 * E), f) != L * E * (4 * E)) goto fail;
+    if (fread(w->mlp_fc1, sizeof(float), L * M * E, f) != L * M * E) goto fail;
+    if (fread(w->mlp_fc2, sizeof(float), L * E * M, f) != L * E * M) goto fail;
     fclose(f);
     return true;
 fail:
@@ -1554,6 +1919,42 @@ static bool token_chat_with_prompt(const Config* cfg, const Weights* w,
     return true;
 }
 
+static int run_bpe_chat_script(const char* binary_path, const char* prompt, const char* dataset_path,
+                               const char* ckpt_path, float temperature, int max_new_tokens) {
+    char data_dir[1024];
+    char temp_buf[64];
+    char max_buf[64];
+    infer_parent_dir(dataset_path, data_dir, sizeof(data_dir));
+    snprintf(temp_buf, sizeof(temp_buf), "%.4f", temperature);
+    snprintf(max_buf, sizeof(max_buf), "%d", max_new_tokens);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "error: failed to start python chat helper\n");
+        return 1;
+    }
+    if (pid == 0) {
+        execlp("python3", "python3",
+               "scripts/chat_guppy_bpe.py",
+               prompt,
+               "--data-dir", data_dir,
+               "--ckpt", ckpt_path,
+               "--binary", binary_path,
+               "--temperature", temp_buf,
+               "--max-new-tokens", max_buf,
+               (char*)NULL);
+        _exit(127);
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        fprintf(stderr, "error: failed waiting for python chat helper\n");
+        return 1;
+    }
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    return 1;
+}
+
 int main(int argc, char** argv) {
     srand(42);  // align with Python gist
 
@@ -1579,8 +1980,7 @@ int main(int argc, char** argv) {
         float temperature = (argc > 5) ? atof(argv[5]) : 0.7f;
 
         if (path_has_suffix(dataset_path, ".bin")) {
-            fprintf(stderr, "error: chat expects a text dataset; use token-chat or scripts/chat_guppy_bpe.py\n");
-            return 1;
+            return run_bpe_chat_script(argv[0], prompt, dataset_path, ckpt_path, temperature, 64);
         }
 
         char** docs = NULL;
@@ -1725,8 +2125,12 @@ int main(int argc, char** argv) {
     int n_head = 4;
     int n_layer = 2;
     int block_size = 16;
+    int ffn_dim = 4 * n_embd;
     int norm_kind = NORM_RMS;
     int tie_embeddings = 0;
+    int act_kind = ACT_RELU2;
+    float dropout_p = 0.0f;
+    int batch_size = env_int_or("MICROGPT_BATCH_SIZE", 1);
     if (argc > 1) num_steps = atoi(argv[1]);
     if (argc > 2) temperature = atof(argv[2]);
     if (argc > 3) num_samples = atoi(argv[3]);
@@ -1738,21 +2142,35 @@ int main(int argc, char** argv) {
     if (argc > 9) block_size = atoi(argv[9]);
     if (argc > 10) learning_rate = atof(argv[10]);
     const char* chat_prompt = (argc > 12) ? argv[12] : NULL;
+    ffn_dim = 4 * n_embd;
 
     if (token_mode) {
         norm_kind = NORM_LAYER;
         tie_embeddings = 1;
+        act_kind = ACT_RELU;
+        dropout_p = 0.1f;
         if (block_size < 128) block_size = 128;
         if (learning_rate > 1e-3f) learning_rate = 1e-3f;
     } else if (dataset_looks_like_chat(docs, n_docs)) {
         norm_kind = NORM_LAYER;
         tie_embeddings = 1;
+        act_kind = ACT_RELU;
+        dropout_p = 0.1f;
         if (block_size < 128) block_size = 128;
         if (learning_rate > 1e-3f) learning_rate = 1e-3f;
     }
 
-    if (n_embd <= 0 || n_head <= 0 || n_layer <= 0 || block_size <= 0) {
-        fprintf(stderr, "error: n_embd, n_head, n_layer, block_size must be positive\n");
+    if (env_equals("MICROGPT_ACT", "gelu")) act_kind = ACT_GELU;
+    if (env_equals("MICROGPT_ACT", "relu2")) act_kind = ACT_RELU2;
+    if (env_equals("MICROGPT_ACT", "relu")) act_kind = ACT_RELU;
+    dropout_p = env_float_or("MICROGPT_DROPOUT", dropout_p);
+    ffn_dim = env_int_or("MICROGPT_FFN_DIM", ffn_dim);
+    if (token_mode || dataset_looks_like_chat(docs, n_docs)) {
+        ffn_dim = env_int_or("MICROGPT_FFN_DIM", 2 * n_embd);
+    }
+
+    if (n_embd <= 0 || n_head <= 0 || n_layer <= 0 || block_size <= 0 || ffn_dim <= 0) {
+        fprintf(stderr, "error: n_embd, n_head, n_layer, block_size, ffn_dim must be positive\n");
         return 1;
     }
     if (learning_rate <= 0.0f) {
@@ -1763,6 +2181,14 @@ int main(int argc, char** argv) {
         fprintf(stderr, "error: n_embd (%d) must be divisible by n_head (%d)\n", n_embd, n_head);
         return 1;
     }
+    if (batch_size <= 0) {
+        fprintf(stderr, "error: MICROGPT_BATCH_SIZE must be positive\n");
+        return 1;
+    }
+    if (dropout_p < 0.0f || dropout_p >= 1.0f) {
+        fprintf(stderr, "error: MICROGPT_DROPOUT must be in [0, 1)\n");
+        return 1;
+    }
 
     Config cfg = {
         .n_embd = n_embd,
@@ -1771,8 +2197,11 @@ int main(int argc, char** argv) {
         .block_size = block_size,
         .head_dim = n_embd / n_head,
         .vocab_size = vocab_size,
+        .ffn_dim = ffn_dim,
         .norm_kind = norm_kind,
         .tie_embeddings = tie_embeddings,
+        .act_kind = act_kind,
+        .dropout_p = dropout_p,
     };
 
     Weights w = {0};
@@ -1797,9 +2226,10 @@ int main(int argc, char** argv) {
         printf("num docs: %d\n", n_docs);
     }
     printf("vocab size: %d\n", cfg.vocab_size);
-    printf("model: n_embd=%d n_head=%d n_layer=%d block_size=%d lr=%.6f norm=%s tied_embeddings=%s\n",
-           cfg.n_embd, cfg.n_head, cfg.n_layer, cfg.block_size, learning_rate,
-           norm_kind_name(cfg.norm_kind), cfg.tie_embeddings ? "yes" : "no");
+    printf("model: n_embd=%d n_head=%d n_layer=%d block_size=%d ffn_dim=%d lr=%.6f batch=%d norm=%s tied_embeddings=%s act=%s dropout=%.2f\n",
+           cfg.n_embd, cfg.n_head, cfg.n_layer, cfg.block_size, cfg.ffn_dim, learning_rate,
+           batch_size, norm_kind_name(cfg.norm_kind), cfg.tie_embeddings ? "yes" : "no",
+           act_kind_name(cfg.act_kind), cfg.dropout_p);
     printf("num params: %zu\n", param_count(&cfg));
 
     float beta1 = 0.9f, beta2 = 0.95f, eps_adam = 1e-8f;
@@ -1823,15 +2253,19 @@ int main(int argc, char** argv) {
     struct timespec t0 = {0}, t1 = {0};
     clock_gettime(CLOCK_MONOTONIC, &t0);
     for (int step = 0; step < num_steps; step++) {
-        if (token_mode) prepare_token_example(token_corpus.train_tokens, token_corpus.n_train_tokens, cfg.block_size, &cache);
-        else {
-            int idx = rand() % n_train;
-            prepare_example(docs[idx], BOS, char_to_id, cfg.block_size, toks, &cache);
-        }
-
         zero_grads(&cfg, &g);
-        float loss = forward_sequence(&cfg, &w, &cache);
-        backward_sequence(&cfg, &w, &cache, &g);
+        float loss = 0.0f;
+        for (int bi = 0; bi < batch_size; bi++) {
+            if (token_mode) prepare_token_example(token_corpus.train_tokens, token_corpus.n_train_tokens, cfg.block_size, &cache);
+            else {
+                int idx = rand() % n_train;
+                prepare_example(docs[idx], BOS, char_to_id, cfg.block_size, toks, &cache);
+            }
+            loss += forward_sequence(&cfg, &w, &cache, true);
+            backward_sequence(&cfg, &w, &cache, &g);
+        }
+        loss /= (float)batch_size;
+        scale_grads(&cfg, &g, 1.0f / (float)batch_size);
 
         float lr_t = learning_rate * 0.5f * (1.0f + cosf((float)M_PI * (float)step / (float)num_steps));
         adam_update(&cfg, &w, &g, &m1, &m2, lr_t, beta1, beta2, eps_adam, step + 1);
@@ -1880,7 +2314,7 @@ int main(int argc, char** argv) {
     printf("\n--- inference ---\n");
     if (token_mode) {
         printf("token-mode training complete.\n");
-        printf("use scripts/prepare_guppy_bpe.py tokenizer.json to decode future token samples.\n");
+        printf("chat with: ./microgpt_mac chat \"tell me a joke\" %s ckpt_best.bin 0.7\n", dataset_path);
     } else if (chat_prompt && chat_prompt[0] != '\0') {
         chat_with_prompt(&cfg, &w, chat_prompt, temperature, id_to_char, char_to_id, BOS);
     } else {

@@ -8,7 +8,7 @@ import sys
 from array import array
 
 
-SPECIAL_TOKENS = ["<pad>", "<|user|>", "<|assistant|>", "<|end|>"]
+SPECIAL_TOKENS = ["<pad>", "<|im_start|>", "<|im_end|>"]
 
 
 def train_tokenizer(texts, vocab_size, tokenizer_path):
@@ -26,6 +26,7 @@ def train_tokenizer(texts, vocab_size, tokenizer_path):
         vocab_size=vocab_size,
         special_tokens=SPECIAL_TOKENS,
         min_frequency=2,
+        initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
         show_progress=True,
     )
     tokenizer.train_from_iterator(texts, trainer)
@@ -38,6 +39,20 @@ def write_bin(path, ids, dtype):
     buf = array("H" if dtype == "u16" else "I", ids)
     with open(path, "wb") as f:
         buf.tofile(f)
+
+
+def convert_legacy_line(line):
+    user_tag = "<|user|>"
+    assistant_tag = "<|assistant|>"
+    end_tag = "<|end|>"
+    if user_tag not in line or assistant_tag not in line:
+        return line
+    user_part = line.split(user_tag, 1)[1]
+    user_text, assistant_part = user_part.split(assistant_tag, 1)
+    assistant_text = assistant_part.split(end_tag, 1)[0]
+    user_text = " ".join(user_text.strip().split()).lower()
+    assistant_text = " ".join(assistant_text.strip().split()).lower()
+    return f"<|im_start|>user\n{user_text}<|im_end|>\n<|im_start|>assistant\n{assistant_text}<|im_end|>"
 
 
 def main():
@@ -73,7 +88,10 @@ def main():
     )
 
     with open(raw_path, "r", encoding="utf-8") as f:
-        lines = [line.rstrip("\n") for line in f if line.strip()]
+        lines = [convert_legacy_line(line.rstrip("\n")) for line in f if line.strip()]
+    with open(raw_path, "w", encoding="utf-8") as f:
+        for line in lines:
+            f.write(line + "\n")
 
     rng = random.Random(args.seed)
     rng.shuffle(lines)
@@ -107,9 +125,8 @@ def main():
         "dtype": dtype,
         "special_tokens": {
             "pad_id": vocab["<pad>"],
-            "user_id": vocab["<|user|>"],
-            "assistant_id": vocab["<|assistant|>"],
-            "end_id": vocab["<|end|>"],
+            "im_start_id": vocab["<|im_start|>"],
+            "im_end_id": vocab["<|im_end|>"],
         },
         "tokenizer_path": "tokenizer.json",
     }

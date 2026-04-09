@@ -8,6 +8,8 @@ eval.csv
 
 # local dataset
 input.txt
+data/
+runs/
 
 # macOS
 .DS_Store

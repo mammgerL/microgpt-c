@@ -20,6 +20,11 @@ def parse_token_reply(stdout):
     raise SystemExit("binary output did not contain guppy_token_ids>")
 
 
+def format_prompt(prompt):
+    clean_prompt = sanitize_chat_text(prompt).strip()
+    return f"<|im_start|>user\n{clean_prompt}<|im_end|>\n<|im_start|>assistant\n"
+
+
 def main():
     parser = argparse.ArgumentParser(description="Chat with a BPE-trained Guppy checkpoint")
     parser.add_argument("prompt")
@@ -56,8 +61,7 @@ def main():
         raise SystemExit("only u16 token datasets are currently supported")
 
     tokenizer = Tokenizer.from_file(tokenizer_path)
-    clean_prompt = sanitize_chat_text(args.prompt).strip()
-    full_prompt = f"<|user|> {clean_prompt} <|assistant|>"
+    full_prompt = format_prompt(args.prompt)
     prompt_ids = tokenizer.encode(full_prompt).ids
     prompt_arg = ",".join(str(token_id) for token_id in prompt_ids)
 
@@ -78,10 +82,10 @@ def main():
 
     reply_ids = parse_token_reply(proc.stdout)
     reply = tokenizer.decode(reply_ids)
-    for tag in ("<|assistant|>", "<|user|>", "<pad>"):
+    for tag in ("<|im_start|>", "<pad>"):
         reply = reply.replace(tag, " ")
-    if "<|end|>" in reply:
-        reply = reply.split("<|end|>", 1)[0]
+    if "<|im_end|>" in reply:
+        reply = reply.split("<|im_end|>", 1)[0]
     reply = reply.strip()
 
     print(f"you> {args.prompt}")
